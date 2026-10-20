@@ -13,7 +13,7 @@ each instance three ways and reporting them side by side:
                     MISOCP strengthened with cuts.
 
 Every method is given the SAME relative optimality gap, DEFAULT_MIP_GAP =
-1e-4 (0.01 percent), matching run_triangular_strongly_correlated.py and
+5e-4 (0.05 percent), matching run_triangular_strongly_correlated.py and
 run_uniform_strongly_correlated.py. This is the Table 3 member of that
 family of scripts and is kept structurally identical to them, with one
 genuine difference that the rest of this docstring is about.
@@ -78,9 +78,9 @@ import triangular_current as tc
 DEFAULT_INSTANCES_CSV = gscd.DEFAULT_OUTPUT_CSV
 DEFAULT_RESULTS_CSV = "strongly_correlated_table3_results_with_cuts.csv"
 
-# 0.01 percent for every method. See the module docstring on what that
+# 0.05 percent for every method. See the module docstring on what that
 # means on each method's own objective scale.
-DEFAULT_MIP_GAP = 1.0e-4
+DEFAULT_MIP_GAP = 5.0e-4
 DEFAULT_TIME_LIMIT_SECONDS = 3600.0
 DEFAULT_THREADS = 1
 DEFAULT_SOLVER = "GUROBI"
@@ -89,6 +89,7 @@ DEFAULT_METHODS = "all"
 BIGM_METHOD = "bigm"
 PERSPECTIVE_METHOD = "perspective"
 CUTS_METHOD = "cuts"
+NOT_APPLICABLE_CUT_FAMILY = "NOT_APPLICABLE"
 METHOD_CHOICES = (BIGM_METHOD, PERSPECTIVE_METHOD, CUTS_METHOD)
 METHOD_MODEL_IDS = {
     BIGM_METHOD: dft.BIGM_MODEL_ID,
@@ -102,7 +103,7 @@ METHOD_LABELS = {
 }
 
 RESULT_FIELDNAMES = (
-    "instance_id", "n", "replication", "method", "model_id", "solver",
+    "instance_id", "n", "replication", "method", "cut_family", "model_id", "solver",
     "mip_gap_setting", "gap_scale",
     "status", "objective", "independent_objective", "independent_profit",
     "zero_quantity_cost",
@@ -321,7 +322,7 @@ def model_match_tolerances(mip_gap: float) -> tuple[float, float]:
     """Objective-agreement tolerances for the cross-method comparisons.
 
     run_triangular_table2_experiment.py documents its own
-    DEFAULT_MODEL_MATCH_REL_TOL (0.002) as "twice default MIP gap" (its
+    DEFAULT_MODEL_MATCH_REL_TOL (0.001) as "twice default MIP gap" (its
     default gap being 1e-3). That relationship is what makes the test
     meaningful -- two methods each stopping within `gap` of the optimum
     can legitimately differ by up to about 2*gap -- so it is preserved
@@ -353,7 +354,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT_SECONDS)
     parser.add_argument(
         "--mip-gap", type=float, default=DEFAULT_MIP_GAP,
-        help="relative optimality gap applied to every method (default 1e-4 = 0.01%%)",
+        help="relative optimality gap applied to every method (default 5e-4 = 0.05%%)",
     )
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     parser.add_argument("--instances-csv", default=DEFAULT_INSTANCES_CSV)
@@ -362,9 +363,13 @@ def make_parser() -> argparse.ArgumentParser:
         "--cut-family", choices=tsc.CUT_FAMILY_CHOICES, default=tsc.DEFAULT_CUT_FAMILY,
         help=(
             "which valid inequality the callback separates: 'dual' (one f-evaluation per cut, "
-            "the capacity-price cut of Lemma 1) or 'nemhauser-wolsey' (inequality (6b) with "
+            "the capacity-price cut of Lemma 1) or 'nemhauser-wolsey' (exact inequality (8b) with "
             "exact marginals, O(n) f-evaluations per cut)"
         ),
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="append only missing (instance, method, cut-family) rows to a compatible CSV",
     )
     return parser
 
@@ -422,14 +427,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     results_path = base / args.results_csv
+    completed_keys: set[tuple[str, str, str]] = set()
+    append_existing = args.resume and results_path.exists() and results_path.stat().st_size > 0
+    if append_existing:
+        with results_path.open("r", encoding="utf-8-sig", newline="") as existing_stream:
+            existing_reader = csv.DictReader(existing_stream)
+            dft.require(
+                tuple(existing_reader.fieldnames or ()) == RESULT_FIELDNAMES,
+                f"{results_path} has an incompatible CSV schema; refusing to resume",
+            )
+            for row in existing_reader:
+                completed_keys.add((row["instance_id"], row["method"], row["cut_family"]))
+
     written_rows: list[dict[str, Any]] = []
-    with results_path.open("w", encoding="utf-8", newline="") as out_stream:
+    mode = "a" if append_existing else "w"
+    with results_path.open(mode, encoding="utf-8", newline="") as out_stream:
         writer = csv.DictWriter(out_stream, fieldnames=RESULT_FIELDNAMES)
-        writer.writeheader()
+        if mode == "w":
+            writer.writeheader()
+            out_stream.flush()
         for instance in instances:
             constant = dft.zero_quantity_cost(instance)
             results_by_method: dict[str, dict[str, Any]] = {}
             for method in methods:
+                row_cut_family = args.cut_family if method == CUTS_METHOD else NOT_APPLICABLE_CUT_FAMILY
+                key = (instance.instance_id, method, row_cut_family)
+                if key in completed_keys:
+                    print(
+                        f"{instance.instance_id} {METHOD_LABELS[method]} "
+                        f"[{row_cut_family}]: already present; skipped"
+                    )
+                    continue
                 if method == CUTS_METHOD:
                     result = solve_cuts_and_collect_stats(
                         instance,
@@ -479,6 +507,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "n": instance.n,
                     "replication": instance.replication,
                     "method": method,
+                    "cut_family": (
+                        args.cut_family if method == CUTS_METHOD else NOT_APPLICABLE_CUT_FAMILY
+                    ),
                     "model_id": METHOD_MODEL_IDS[method],
                     # The cut master always runs on GUROBI (lazy-constraint
                     # callback); --solver only selects the MISOCP backend.
@@ -508,8 +539,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     row[f"{pair}_profit_rel_diff"] = profit_relative
                     row[f"{pair}_classification"] = classification
                 writer.writerow(row)
+                out_stream.flush()
                 written_rows.append(row)
-            out_stream.flush()
+                completed_keys.add(
+                    (row["instance_id"], row["method"], row["cut_family"])
+                )
 
     print(f"\nWrote results to {results_path}")
     summarize(written_rows, methods)

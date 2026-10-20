@@ -56,19 +56,20 @@ consequences worth noting:
     accuracy therefore affects only how tight the cut is (and hence
     convergence speed), never correctness -- a cut can never remove the
     true optimum.
-  * (*) is the Nemhauser-Wolsey inequality (6b) with the exact marginal
+  * (*) is the Nemhauser-Wolsey inequality (8b) with the exact marginal
     rho_i(S) replaced by the dual upper bound pi*_i(nu_S) >= rho_i(S)
     (evaluate (3) for S+{i} at nu_S and subtract f(S)). Overestimating
     the marginals keeps validity and costs only tightness.
 
-"nemhauser-wolsey". The document's (6b) verbatim, with exact marginals
+"nemhauser-wolsey". The current manuscript's (8b) verbatim, with exact marginals
 rho_i(S) = f(S+{i}) - f(S) and rho_i(N\\{i}) = f(N) - f(N\\{i}):
 
     y <= f(S) + sum_{i in S} rho_i(N\\{i})(z_i - 1) + sum_{i not in S} rho_i(S) z_i
 
-Tighter than (*) away from S, but it costs |N\\S| extra evaluations of f
-per cut (plus n once, up front, for the rho_i(N\\{i}) terms) instead of
-zero, i.e. O(n) bisections per callback rather than one. Offered for
+Tighter than (*) away from S, but a violated incumbent costs |N\\S| extra
+evaluations of f (plus n+1 once, up front, for the rho_i(N\\{i}) terms)
+instead of zero. The callback first evaluates f(S) and only computes those
+extra coefficients if the incumbent is actually violated. Offered for
 comparison; not recommended at the larger n.
 
 The f-oracle itself reuses triangular_2018.py's exact dual bisection
@@ -90,7 +91,8 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from typing import Any, Sequence
+from collections import OrderedDict
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -122,6 +124,15 @@ DEFAULT_CUT_VIOLATION_REL_TOL = 1.0e-9
 
 class SubmodularCutError(RuntimeError):
     """Raised when input data or solver configuration is invalid."""
+
+
+class _CutTimeLimitReached(RuntimeError):
+    """Internal cooperative timeout for work performed outside GUROBI.
+
+    An individual oracle evaluation cannot be interrupted safely, so the
+    deadline is checked immediately before and after every evaluation.  The
+    exception is caught inside this module and is never part of the public API.
+    """
 
 
 def _require(condition: bool, message: str) -> None:
@@ -619,24 +630,29 @@ class DistributionFreeCapacityOracle(CapacityOracle):
 
 
 def dual_price_cut(
-    oracle: TriangularCapacityOracle, mask: np.ndarray
+    oracle: CapacityOracle,
+    mask: np.ndarray,
+    capacity_value: CapacityValue | None = None,
 ) -> tuple[float, np.ndarray, CapacityValue]:
     """The cut (*): y <= constant + sum_i coefficients[i] * z_i, valid for
     every z and tight at ``mask``. Returns (constant, coefficients, the
     f(S) evaluation it was built from).
     """
-    capacity_value = oracle.evaluate(mask)
+    if capacity_value is None:
+        capacity_value = oracle.evaluate(mask)
     coefficients = oracle.conjugates(capacity_value.multiplier)
     constant = capacity_value.multiplier * oracle.C
     return constant, coefficients, capacity_value
 
 
 def nemhauser_wolsey_cut(
-    oracle: TriangularCapacityOracle,
+    oracle: CapacityOracle,
     mask: np.ndarray,
     marginal_at_full_set: np.ndarray,
+    capacity_value: CapacityValue | None = None,
+    evaluate: Callable[[np.ndarray], CapacityValue] | None = None,
 ) -> tuple[float, np.ndarray, CapacityValue]:
-    """Inequality (6b) verbatim, with exact marginals. Rearranged to the
+    """Inequality (8b) verbatim, with exact marginals. Rearranged to the
     same ``y <= constant + coefficients @ z`` shape as dual_price_cut by
     folding the -sum_{i in S} rho_i(N\\{i}) term into the constant.
 
@@ -644,34 +660,44 @@ def nemhauser_wolsey_cut(
     module docstring on why "dual" is the default.
     """
     mask = np.asarray(mask, dtype=bool)
-    capacity_value = oracle.evaluate(mask)
+    evaluate = oracle.evaluate if evaluate is None else evaluate
+    if capacity_value is None:
+        capacity_value = evaluate(mask)
     coefficients = np.zeros(oracle.n)
     coefficients[mask] = marginal_at_full_set[mask]
     for index in np.where(~mask)[0]:
         augmented = mask.copy()
         augmented[index] = True
-        coefficients[index] = oracle.evaluate(augmented).value - capacity_value.value
+        coefficients[index] = evaluate(augmented).value - capacity_value.value
     constant = capacity_value.value - float(marginal_at_full_set[mask].sum())
     return constant, coefficients, capacity_value
 
 
-def marginals_at_full_set(oracle: TriangularCapacityOracle) -> np.ndarray:
+def marginals_at_full_set(
+    oracle: CapacityOracle,
+    evaluate: Callable[[np.ndarray], CapacityValue] | None = None,
+) -> np.ndarray:
     """rho_i(N\\{i}) = f(N) - f(N\\{i}) for every i -- the middle-sum
-    coefficients of (6b). n evaluations of f, computed once.
+    coefficients of (8b). n+1 evaluations of f, computed once.
     """
+    evaluate = oracle.evaluate if evaluate is None else evaluate
     full = np.ones(oracle.n, dtype=bool)
-    full_value = oracle.evaluate(full).value
+    full_value = evaluate(full).value
     marginals = np.zeros(oracle.n)
     for index in range(oracle.n):
         without = full.copy()
         without[index] = False
-        marginals[index] = full_value - oracle.evaluate(without).value
+        marginals[index] = full_value - evaluate(without).value
     return marginals
 
 
 @dataclasses.dataclass(slots=True)
 class SubmodularCutSolveResult:
-    """Outcome of one master solve, in the shape the runners report."""
+    """Outcome of one master solve, in the shape the runners report.
+
+    ``solve_seconds`` is total cut-method wall time: validation, exact-cut
+    preprocessing, model/seed construction, GUROBI, and final evaluation.
+    """
 
     status: str
     objective: float | None
@@ -680,7 +706,7 @@ class SubmodularCutSolveResult:
     node_count: int | None
     solve_seconds: float
     cut_count: int
-    oracle_evaluations: int
+    oracle_evaluations: int  # actual oracle.evaluate calls; cache hits excluded
     mip_gap: float | None
     best_bound: float | None
 
@@ -766,7 +792,7 @@ def solve_fixed_cost_submodular_cuts(
     K: float,
     *,
     time_limit_seconds: float = 3600.0,
-    mip_gap: float = 1.0e-3,
+    mip_gap: float = 5.0e-4,
     threads: int = 1,
     verbose: bool = False,
     cut_family: str = DEFAULT_CUT_FAMILY,
@@ -778,72 +804,165 @@ def solve_fixed_cost_submodular_cuts(
     implements. ``x_u`` is accepted for interface symmetry with the other
     builders and validated against the oracle's own nu=0 response; the
     bound x_i <= x^U_i is itself redundant (Proposition 1 / Section 1).
+    ``time_limit_seconds`` covers the complete method call, not only
+    ``model.optimize``; GUROBI is assigned the remaining budget.
     """
+    wall_started = time.perf_counter()
+    _require(
+        np.isfinite(time_limit_seconds) and time_limit_seconds > 0.0,
+        "time_limit_seconds must be finite and positive",
+    )
+    deadline = wall_started + float(time_limit_seconds)
+
+    def remaining_seconds() -> float:
+        return deadline - time.perf_counter()
+
+    def check_deadline() -> None:
+        if remaining_seconds() <= 0.0:
+            raise _CutTimeLimitReached
+
+    # Count actual calls into oracle.evaluate, not logical requests served
+    # from this solve's cache.  CapacityValue stores an O(n) quantity vector,
+    # so retain only a bounded LRU working set (enough for several complete
+    # exact-cut coefficient vectors even at the largest table sizes).
+    evaluation_counter = {"count": 0}
+    evaluation_cache: OrderedDict[bytes, CapacityValue] = OrderedDict()
+    max_cache_entries = max(256, min(4096, 8 * oracle.n + 32))
+
+    def counted_evaluate(mask: np.ndarray) -> CapacityValue:
+        normalized = np.asarray(mask, dtype=bool)
+        key = normalized.tobytes()
+        cached = evaluation_cache.get(key)
+        if cached is not None:
+            evaluation_cache.move_to_end(key)
+            return cached
+        check_deadline()
+        evaluation_counter["count"] += 1
+        evaluated = oracle.evaluate(normalized)
+        evaluation_cache[key] = evaluated
+        evaluation_cache.move_to_end(key)
+        if len(evaluation_cache) > max_cache_entries:
+            evaluation_cache.popitem(last=False)
+        # Oracle calls are not safely interruptible.  If one crosses the
+        # deadline, do not start any subsequent preprocessing or GUROBI work.
+        check_deadline()
+        return evaluated
+
+    state: dict[str, Any] = {"cuts": 0, "timed_out": False}
+
+    def timeout_result() -> SubmodularCutSolveResult:
+        return SubmodularCutSolveResult(
+            status="time_limit",
+            objective=None,
+            selected=None,
+            quantities=None,
+            node_count=0,
+            solve_seconds=time.perf_counter() - wall_started,
+            cut_count=int(state["cuts"]),
+            oracle_evaluations=evaluation_counter["count"],
+            mip_gap=None,
+            best_bound=None,
+        )
+
     import gurobipy as gp
     from gurobipy import GRB
 
     _require(cut_family in CUT_FAMILY_CHOICES, f"cut_family must be one of {CUT_FAMILY_CHOICES}")
-    C = oracle.C
     n = oracle.n
     k = np.asarray(k, dtype=float)
     _require(k.shape == (n,), f"k must have shape ({n},)")
     _require(bool(np.all(k >= 0.0)), "k must be nonnegative")
     _require(np.isfinite(K) and K >= 0.0, "K must be finite and nonnegative")
 
-    # The unconstrained single-product optima are exactly the nu=0
-    # response; a mismatch means the instance data and this oracle
-    # disagree about the model, which would silently corrupt every cut.
-    oracle.validate_unconstrained(x_u)
+    try:
+        check_deadline()
+        # The unconstrained single-product optima are exactly the nu=0
+        # response; a mismatch means the instance data and this oracle
+        # disagree about the model, which would silently corrupt every cut.
+        oracle.validate_unconstrained(x_u)
+        check_deadline()
 
-    full_set_marginals = (
-        marginals_at_full_set(oracle) if cut_family == "nemhauser-wolsey" else None
-    )
-    evaluation_counter = {"count": 0}
+        full_set_marginals = (
+            marginals_at_full_set(oracle, counted_evaluate)
+            if cut_family == "nemhauser-wolsey"
+            else None
+        )
+    except _CutTimeLimitReached:
+        return timeout_result()
 
-    def build_cut(mask: np.ndarray) -> tuple[float, np.ndarray, CapacityValue]:
-        evaluation_counter["count"] += 1
+    def build_cut(
+        mask: np.ndarray,
+        capacity_value: CapacityValue | None = None,
+    ) -> tuple[float, np.ndarray, CapacityValue]:
+        if capacity_value is None:
+            capacity_value = counted_evaluate(mask)
         if cut_family == "dual":
-            return dual_price_cut(oracle, mask)
-        evaluation_counter["count"] += int((~mask).sum())
-        return nemhauser_wolsey_cut(oracle, mask, full_set_marginals)
+            return dual_price_cut(oracle, mask, capacity_value)
+        return nemhauser_wolsey_cut(
+            oracle,
+            mask,
+            full_set_marginals,
+            capacity_value,
+            counted_evaluate,
+        )
 
-    model = gp.Model(MODEL_ID)
-    model.Params.OutputFlag = 1 if verbose else 0
-    model.Params.LazyConstraints = 1
-    model.Params.TimeLimit = time_limit_seconds
-    model.Params.MIPGap = mip_gap
-    model.Params.Threads = threads
+    try:
+        check_deadline()
+        model = gp.Model(MODEL_ID)
+        model.Params.OutputFlag = 1 if verbose else 0
+        model.Params.LazyConstraints = 1
+        model.Params.MIPGap = mip_gap
+        model.Params.Threads = threads
 
-    z = model.addVars(n, vtype=GRB.BINARY, name="z")
-    y = model.addVar(lb=0.0, ub=GRB.INFINITY, name="y")
-    model.setObjective(y, GRB.MAXIMIZE)
-    model.addConstr(gp.quicksum(float(k[i]) * z[i] for i in range(n)) <= float(K), name="budget")
+        z = model.addVars(n, vtype=GRB.BINARY, name="z")
+        y = model.addVar(lb=0.0, ub=GRB.INFINITY, name="y")
+        model.setObjective(y, GRB.MAXIMIZE)
+        model.addConstr(
+            gp.quicksum(float(k[i]) * z[i] for i in range(n)) <= float(K),
+            name="budget",
+        )
+        z_list = [z[i] for i in range(n)]
+        check_deadline()
 
-    z_list = [z[i] for i in range(n)]
+        def add_cut_as_constraint(mask: np.ndarray) -> None:
+            check_deadline()
+            constant, coefficients, _ = build_cut(mask)
+            check_deadline()
+            model.addConstr(y <= constant + gp.LinExpr(coefficients.tolist(), z_list))
+            state["cuts"] += 1
 
-    def add_cut_as_constraint(mask: np.ndarray) -> None:
-        constant, coefficients, _ = build_cut(mask)
-        model.addConstr(y <= constant + gp.LinExpr(coefficients.tolist(), z_list))
-
-    # Seed cuts. S = {} gives nu = 0, i.e. y <= sum_i pi_i(x^U_i) z_i (the
-    # uncapacitated bound); S = N bounds y by f(N) and makes the master
-    # bounded from the start.
-    add_cut_as_constraint(np.zeros(n, dtype=bool))
-    add_cut_as_constraint(np.ones(n, dtype=bool))
-
-    state = {"cuts": 2}
+        # Seed cuts. S = {} gives nu = 0, i.e. y <= sum_i pi_i(x^U_i) z_i
+        # (the uncapacitated bound); S = N bounds y by f(N) and makes the
+        # master bounded from the start.  Their oracle work is part of the
+        # same total wall-clock budget and the same evaluation count.
+        add_cut_as_constraint(np.zeros(n, dtype=bool))
+        add_cut_as_constraint(np.ones(n, dtype=bool))
+        check_deadline()
+    except _CutTimeLimitReached:
+        return timeout_result()
 
     def callback(cb_model: Any, where: int) -> None:
-        if where != GRB.Callback.MIPSOL:
+        if where != GRB.Callback.MIPSOL or state["timed_out"]:
             return
-        z_values = np.asarray(cb_model.cbGetSolution(z_list), dtype=float)
-        y_value = float(cb_model.cbGetSolution(y))
-        mask = z_values > 0.5
-        constant, coefficients, capacity_value = build_cut(mask)
-        tolerance = violation_abs_tol + violation_rel_tol * max(1.0, abs(capacity_value.value))
-        if y_value > capacity_value.value + tolerance:
-            # Sparsify: pi*_i(nu) >= 0 always, and products worth nothing
-            # at this capacity price contribute nothing to the cut.
+        try:
+            check_deadline()
+            z_values = np.asarray(cb_model.cbGetSolution(z_list), dtype=float)
+            y_value = float(cb_model.cbGetSolution(y))
+            mask = z_values > 0.5
+
+            # First pay for f(S) only.  Most importantly for exact (8b), do
+            # not compute the |N\\S| expensive marginal coefficients unless
+            # this incumbent actually violates y <= f(S).  build_cut reuses
+            # this exact CapacityValue, so f(S) is never evaluated twice.
+            capacity_value = counted_evaluate(mask)
+            tolerance = violation_abs_tol + violation_rel_tol * max(
+                1.0, abs(capacity_value.value)
+            )
+            if y_value <= capacity_value.value + tolerance:
+                return
+
+            constant, coefficients, _ = build_cut(mask, capacity_value)
+            check_deadline()
             support = np.where(np.abs(coefficients) > 0.0)[0]
             cb_model.cbLazy(
                 y
@@ -853,10 +972,23 @@ def solve_fixed_cost_submodular_cuts(
                 )
             )
             state["cuts"] += 1
+        except _CutTimeLimitReached:
+            # Never add a partially constructed exact cut.  Ask GUROBI to
+            # return immediately; below, INTERRUPTED is reported as our
+            # externally enforced time_limit.
+            state["timed_out"] = True
+            cb_model.terminate()
 
-    started = time.perf_counter()
-    model.optimize(callback)
-    elapsed = time.perf_counter() - started
+    try:
+        gurobi_seconds = remaining_seconds()
+        if gurobi_seconds <= 0.0:
+            raise _CutTimeLimitReached
+        # GUROBI receives only the budget left after validation, exact
+        # full-set marginals, model construction, and both seed cuts.
+        model.Params.TimeLimit = gurobi_seconds
+        model.optimize(callback)
+    except _CutTimeLimitReached:
+        return timeout_result()
 
     status_names = {
         GRB.OPTIMAL: "optimal",
@@ -867,6 +999,8 @@ def solve_fixed_cost_submodular_cuts(
         GRB.INTERRUPTED: "interrupted",
     }
     status = status_names.get(model.Status, str(model.Status))
+    if state["timed_out"]:
+        status = "time_limit"
 
     selected = None
     quantities = None
@@ -877,9 +1011,16 @@ def solve_fixed_cost_submodular_cuts(
         # Report the true achievable profit of the selected set, recomputed
         # from the oracle (the master's y is only an upper bound until the
         # cut for this set has been added).
-        final = oracle.evaluate(selected)
-        objective = final.value
-        quantities = final.quantities
+        try:
+            # Usually a cache hit because every accepted integer incumbent is
+            # evaluated in the callback.  A genuine final oracle call is both
+            # charged to the wall-clock limit and included in the counter.
+            final = counted_evaluate(selected)
+            objective = final.value
+            quantities = final.quantities
+        except _CutTimeLimitReached:
+            state["timed_out"] = True
+            status = "time_limit"
 
     return SubmodularCutSolveResult(
         status=status,
@@ -887,7 +1028,7 @@ def solve_fixed_cost_submodular_cuts(
         selected=selected,
         quantities=quantities,
         node_count=int(model.NodeCount),
-        solve_seconds=elapsed,
+        solve_seconds=time.perf_counter() - wall_started,
         cut_count=state["cuts"],
         oracle_evaluations=evaluation_counter["count"],
         mip_gap=float(model.MIPGap) if model.SolCount > 0 else None,

@@ -17,7 +17,7 @@ methods run on every instance by default so the new table can carry the
 cuts-vs-MISOCP comparison columns directly.
 
 Every method is given the SAME relative optimality gap, DEFAULT_MIP_GAP =
-1e-4 (0.01 percent), tighter than the 1e-3 used in earlier runs, so that
+5e-4 (0.05 percent), tighter than the 1e-3 used in earlier runs, so that
 objective differences between methods are read against one common
 tolerance.
 
@@ -50,10 +50,10 @@ import triangular_current as tc
 DEFAULT_INSTANCES_CSV = "uniform_table1_instances_strongly_correlated.csv"
 DEFAULT_RESULTS_CSV = "strongly_correlated_table1_results.csv"
 
-# 0.01 percent for every method (MISOCP and cut master alike). Earlier
+# 0.05 percent for every method (MISOCP and cut master alike). Earlier
 # Table 1/Table 2 runs used 1e-3; the tighter setting here is what the new
 # table is specified at.
-DEFAULT_MIP_GAP = 1.0e-4
+DEFAULT_MIP_GAP = 5.0e-4
 DEFAULT_TIME_LIMIT_SECONDS = 3600.0
 DEFAULT_THREADS = 1
 DEFAULT_SOLVER = "GUROBI"
@@ -62,6 +62,7 @@ DEFAULT_METHODS = "all"
 BIGM_METHOD = "bigm"
 PERSPECTIVE_METHOD = "perspective"
 CUTS_METHOD = "cuts"
+NOT_APPLICABLE_CUT_FAMILY = "NOT_APPLICABLE"
 METHOD_CHOICES = (BIGM_METHOD, PERSPECTIVE_METHOD, CUTS_METHOD)
 METHOD_MODEL_IDS = {
     BIGM_METHOD: rue.BIGM_MODEL_ID,
@@ -75,7 +76,7 @@ METHOD_LABELS = {
 }
 
 RESULT_FIELDNAMES = (
-    "instance_id", "n", "replication", "method", "model_id", "solver",
+    "instance_id", "n", "replication", "method", "cut_family", "model_id", "solver",
     "mip_gap_setting",
     "status", "objective", "independent_objective",
     "node_count", "native_relative_gap", "solve_seconds",
@@ -262,7 +263,7 @@ def model_match_tolerances(mip_gap: float) -> tuple[float, float]:
     """Objective-agreement tolerances for the cross-method comparisons.
 
     run_uniform_table1_experiment.py documents its own
-    DEFAULT_MODEL_MATCH_REL_TOL (0.002) as "twice default MIP gap" (its
+    DEFAULT_MODEL_MATCH_REL_TOL (0.001) as "twice default MIP gap" (its
     default gap being 1e-3). That relationship is what makes the test
     meaningful -- two methods each stopping within `gap` of the optimum can
     legitimately differ by up to about 2*gap -- so it is preserved here
@@ -293,7 +294,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT_SECONDS)
     parser.add_argument(
         "--mip-gap", type=float, default=DEFAULT_MIP_GAP,
-        help="relative optimality gap applied to every method (default 1e-4 = 0.01%%)",
+        help="relative optimality gap applied to every method (default 5e-4 = 0.05%%)",
     )
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     parser.add_argument("--instances-csv", default=DEFAULT_INSTANCES_CSV)
@@ -302,9 +303,13 @@ def make_parser() -> argparse.ArgumentParser:
         "--cut-family", choices=tsc.CUT_FAMILY_CHOICES, default=tsc.DEFAULT_CUT_FAMILY,
         help=(
             "which valid inequality the callback separates: 'dual' (one f-evaluation per cut, "
-            "the capacity-price cut of Lemma 1) or 'nemhauser-wolsey' (inequality (6b) with "
+            "the capacity-price cut of Lemma 1) or 'nemhauser-wolsey' (exact inequality (8b) with "
             "exact marginals, O(n) f-evaluations per cut)"
         ),
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="append only missing (instance, method, cut-family) rows to a compatible CSV",
     )
     return parser
 
@@ -364,13 +369,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     results_path = base / args.results_csv
+    completed_keys: set[tuple[str, str, str]] = set()
+    append_existing = args.resume and results_path.exists() and results_path.stat().st_size > 0
+    if append_existing:
+        with results_path.open("r", encoding="utf-8-sig", newline="") as existing_stream:
+            existing_reader = csv.DictReader(existing_stream)
+            rue.require(
+                tuple(existing_reader.fieldnames or ()) == RESULT_FIELDNAMES,
+                f"{results_path} has an incompatible CSV schema; refusing to resume",
+            )
+            for row in existing_reader:
+                completed_keys.add((row["instance_id"], row["method"], row["cut_family"]))
+
     written_rows: list[dict[str, Any]] = []
-    with results_path.open("w", encoding="utf-8", newline="") as out_stream:
+    mode = "a" if append_existing else "w"
+    with results_path.open(mode, encoding="utf-8", newline="") as out_stream:
         writer = csv.DictWriter(out_stream, fieldnames=RESULT_FIELDNAMES)
-        writer.writeheader()
+        if mode == "w":
+            writer.writeheader()
+            out_stream.flush()
         for instance in instances:
             results_by_method: dict[str, dict[str, Any]] = {}
             for method in methods:
+                row_cut_family = args.cut_family if method == CUTS_METHOD else NOT_APPLICABLE_CUT_FAMILY
+                key = (instance.instance_id, method, row_cut_family)
+                if key in completed_keys:
+                    print(
+                        f"{instance.instance_id} {METHOD_LABELS[method]} "
+                        f"[{row_cut_family}]: already present; skipped"
+                    )
+                    continue
                 if method == CUTS_METHOD:
                     result = solve_cuts_and_collect_stats(
                         instance,
@@ -420,6 +448,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "n": instance.n,
                     "replication": instance.replication,
                     "method": method,
+                    "cut_family": (
+                        args.cut_family if method == CUTS_METHOD else NOT_APPLICABLE_CUT_FAMILY
+                    ),
                     "model_id": METHOD_MODEL_IDS[method],
                     # The cut master always runs on GUROBI (lazy-constraint
                     # callback); --solver only selects the MISOCP backend.
@@ -444,8 +475,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     row[f"{pair}_rel_diff"] = relative
                     row[f"{pair}_classification"] = classification
                 writer.writerow(row)
+                out_stream.flush()
                 written_rows.append(row)
-            out_stream.flush()
+                completed_keys.add(
+                    (row["instance_id"], row["method"], row["cut_family"])
+                )
 
     print(f"\nWrote results to {results_path}")
     summarize(written_rows, methods)

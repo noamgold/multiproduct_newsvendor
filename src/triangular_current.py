@@ -59,18 +59,14 @@ SUPPORTED_SOLVERS = ("CPLEX", "MOSEK", "GUROBI")
 CONTINUOUS_MODEL_ID = "CURRENT_TRIANGULAR_CONIC_CONTINUOUS"
 BIGM_MODEL_ID = "CURRENT_TRIANGULAR_BIGM_FIXED_COST"
 PERSPECTIVE_MODEL_ID = "CURRENT_TRIANGULAR_PERSPECTIVE_FIXED_COST"
-# The perspective model plus the manuscript revision's valid inequality
-# (15i), u_hat_i <= (min{x^U_i, m_i} - a_i)^2. NOTE ON NUMBERING: the
-# revision renumbers the triangular formulation (9) -> (15) and the
-# perspective replacement constraint (5) -> (11), so "(15c) replaced by
-# (11)" names the same model this file already builds as
-# PERSPECTIVE_MODEL_ID. Only (15i) is new.
-PERSPECTIVE_BOUNDED_MODEL_ID = "CURRENT_TRIANGULAR_PERSPECTIVE_15I_FIXED_COST"
+# Disabled: the experimental perspective-with-(15i) model is intentionally
+# not exposed by this module.
+# PERSPECTIVE_WITH_15I_MODEL_ID = "CURRENT_TRIANGULAR_PERSPECTIVE_FIXED_COST_WITH_15I"
 
 MODEL_LABELS = {
     BIGM_MODEL_ID: "Big-M (9)",
-    PERSPECTIVE_MODEL_ID: "Conic (9) with (9c) replaced by (5)",
-    PERSPECTIVE_BOUNDED_MODEL_ID: "Conic perspective + (15i)",
+    PERSPECTIVE_MODEL_ID: "Perspective",
+    # PERSPECTIVE_WITH_15I_MODEL_ID: "Perspective with (15i)",
 }
 
 
@@ -220,21 +216,12 @@ def _build_triangular_fixed_cost_model(
     K: float,
     *,
     perspective: bool,
-    include_u_hat_bound: bool = False,
+    # Disabled: add_constraint_15i: bool = False,
 ) -> TriangularFormulation:
     """Formulation (9) (perspective=False) or its perspective reformulation
     (perspective=True), which replaces the hyperbolic constraint (9c) by the
     bilinear/perspective constraint (5), following manuscript Section 5.
-
-    ``include_u_hat_bound`` adds the manuscript revision's valid inequality
-    (15i), u_hat_i <= (min{x^U_i, m_i} - a_i)^2 -- see the comment at the
-    constraint itself. It is only accepted together with perspective=True,
-    which is where the revision states it.
     """
-    _require(
-        perspective or not include_u_hat_bound,
-        "(15i) is specified only for the perspective formulation",
-    )
     n = len(a)
     a, m, b = (_as_vector(v, n, name) for v, name in ((a, "a"), (m, "m"), (b, "b")))
     p = _as_vector(price_p, n, "price_p")
@@ -293,35 +280,23 @@ def _build_triangular_fixed_cost_model(
         cp.sum(q) <= C,
         k @ z <= K,
     ]
-    if include_u_hat_bound:
-        # (15i): u_hat_i <= (min{x^U_i, m_i} - a_i)^2 = hat_bigm_i^2. In the
-        # rescaled variables u_hat = hat_scale^2 * u_hat_scaled, so the
-        # bound becomes u_hat_scaled <= (hat_bigm / hat_scale)^2.
-        #
-        # Redundant at integer z (there (15g) gives hat_x <= hat_bigm, and
-        # (15d) forces u_hat = 0 whenever hat_x = 0), but NOT redundant in
-        # the continuous relaxation of the perspective model: there
-        # hat_x^2 <= u_hat * z with fractional z admits u_hat >= hat_x^2/z,
-        # which this caps. That is exactly why the revision states it for
-        # the perspective formulation only.
-        constraints.append(u_hat_scaled <= (hat_bigm / hat_scale) ** 2)
     multiplier = z if perspective else 1.0
     _add_rotated_cone(constraints, hat_x_scaled, u_hat_scaled, multiplier)
     _add_rotated_cone(constraints, u_hat_scaled, w_hat_scaled, hat_x_scaled)
     _add_rotated_cone(constraints, y_scaled, u_y_scaled, 1.0)
     _add_rotated_cone(constraints, u_y_scaled, w_y_scaled, y_scaled)
+    # Disabled experimental constraint (15i):
+    # if add_constraint_15i:
+    #     # u_hat_i <= (min{x_i^U, m_i} - a_i)^2.
+    #     # u_hat_scaled = u_hat / hat_scale^2.
+    #     constraints.append(u_hat_scaled <= (hat_bigm / hat_scale) ** 2)
 
     objective = _triangular_objective(a, m, b, p, c, s, bar_x, hat_x, y, w_hat, w_y)
     problem = cp.Problem(cp.Maximize(objective), constraints)
     _require(problem.is_dcp(), "Triangular fixed-cost CVXPY model is not DCP")
     _require(problem.is_mixed_integer(), "Triangular fixed-cost CVXPY model is not mixed-integer")
 
-    if not perspective:
-        model_id = BIGM_MODEL_ID
-    elif include_u_hat_bound:
-        model_id = PERSPECTIVE_BOUNDED_MODEL_ID
-    else:
-        model_id = PERSPECTIVE_MODEL_ID
+    model_id = PERSPECTIVE_MODEL_ID if perspective else BIGM_MODEL_ID
     return TriangularFormulation(
         problem=problem,
         variables={
@@ -369,25 +344,24 @@ def build_current_triangular_perspective_fixed_cost(
     )
 
 
-def build_current_triangular_perspective_bounded_fixed_cost(
-    a: Sequence[float],
-    m: Sequence[float],
-    b: Sequence[float],
-    price_p: Sequence[float],
-    cost_c: Sequence[float],
-    salvage_s: Sequence[float],
-    x_u: Sequence[float],
-    k: Sequence[float],
-    C: float,
-    K: float,
-) -> TriangularFormulation:
-    """The perspective reformulation PLUS the revision's valid inequality
-    (15i), u_hat_i <= (min{x^U_i, m_i} - a_i)^2.
-    """
-    return _build_triangular_fixed_cost_model(
-        a, m, b, price_p, cost_c, salvage_s, x_u, k, C, K,
-        perspective=True, include_u_hat_bound=True,
-    )
+# Disabled experimental public builder for the perspective-with-(15i) variant.
+# def build_current_triangular_perspective_fixed_cost_with_15i(
+#     a: Sequence[float],
+#     m: Sequence[float],
+#     b: Sequence[float],
+#     price_p: Sequence[float],
+#     cost_c: Sequence[float],
+#     salvage_s: Sequence[float],
+#     x_u: Sequence[float],
+#     k: Sequence[float],
+#     C: float,
+#     K: float,
+# ) -> TriangularFormulation:
+#     """Perspective formulation strengthened by manuscript constraint (15i)."""
+#     return _build_triangular_fixed_cost_model(
+#         a, m, b, price_p, cost_c, salvage_s, x_u, k, C, K,
+#         perspective=True, add_constraint_15i=True,
+#     )
 
 
 def solver_options(
@@ -446,7 +420,7 @@ def solve_current_triangular_model(
     *,
     solver: str | None = None,
     time_limit_seconds: float = 3600.0,
-    mip_gap: float = 1.0e-3,
+    mip_gap: float = 5.0e-4,
     threads: int = 1,
     verbose: bool = False,
 ) -> Any:
@@ -489,38 +463,30 @@ def _self_test() -> None:
 
     bigm = build_current_triangular_bigm_fixed_cost(a, m, b, p, c, s, x_u, k, C, K)
     perspective = build_current_triangular_perspective_fixed_cost(a, m, b, p, c, s, x_u, k, C, K)
+    # Disabled perspective-with-(15i) self-test:
+    # perspective_15i = build_current_triangular_perspective_fixed_cost_with_15i(
+    #     a, m, b, p, c, s, x_u, k, C, K
+    # )
     _require(bigm.model_id == BIGM_MODEL_ID, "self-test: bigm model_id mismatch")
     _require(perspective.model_id == PERSPECTIVE_MODEL_ID, "self-test: perspective model_id mismatch")
+    # _require(
+    #     perspective_15i.model_id == PERSPECTIVE_WITH_15I_MODEL_ID,
+    #     "self-test: perspective with (15i) model_id mismatch",
+    # )
     _require(bigm.problem.is_dcp() and bigm.problem.is_mixed_integer(), "self-test: bigm not a valid MISOCP")
     _require(
         perspective.problem.is_dcp() and perspective.problem.is_mixed_integer(),
         "self-test: perspective not a valid MISOCP",
     )
-
-    bounded = build_current_triangular_perspective_bounded_fixed_cost(
-        a, m, b, p, c, s, x_u, k, C, K
-    )
-    _require(
-        bounded.model_id == PERSPECTIVE_BOUNDED_MODEL_ID,
-        "self-test: perspective+(15i) model_id mismatch",
-    )
-    _require(
-        bounded.problem.is_dcp() and bounded.problem.is_mixed_integer(),
-        "self-test: perspective+(15i) not a valid MISOCP",
-    )
-    _require(
-        len(bounded.problem.constraints) == len(perspective.problem.constraints) + 1,
-        "self-test: perspective+(15i) did not add exactly one constraint",
-    )
-    try:
-        _build_triangular_fixed_cost_model(
-            a, m, b, p, c, s, x_u, k, C, K, perspective=False, include_u_hat_bound=True
-        )
-    except TriangularModelError:
-        pass
-    else:  # pragma: no cover - guard must reject the big-M combination
-        raise AssertionError("self-test: (15i) was accepted without the perspective lift")
-
+    # _require(
+    #     perspective_15i.problem.is_dcp() and perspective_15i.problem.is_mixed_integer(),
+    #     "self-test: perspective with (15i) not a valid MISOCP",
+    # )
+    # _require(
+    #     len(perspective_15i.problem.constraints)
+    #     == len(perspective.problem.constraints) + 1,
+    #     "self-test: perspective with (15i) must add exactly one vector constraint",
+    # )
     print("TRIANGULAR_CURRENT_SELF_TEST_PASS")
 
 

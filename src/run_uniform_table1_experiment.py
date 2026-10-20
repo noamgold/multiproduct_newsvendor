@@ -66,7 +66,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 DEFAULT_SOLVER = "CPLEX"                  # CPLEX, MOSEK, or BOTH
 DEFAULT_TIME_LIMIT_SECONDS = 3600.0       # Table 1: one hour per model
-DEFAULT_MIP_GAP = 0.001                   # Table 1: 0.1 percent
+DEFAULT_MIP_GAP = 0.0005                  # Table 1: 0.05 percent
 DEFAULT_THREADS = 1                       # Reproducible/fair default
 DEFAULT_N_VALUES = "100,200,300,400,500,600,700"
 DEFAULT_REPLICATIONS = "1-30"
@@ -92,7 +92,7 @@ DEFAULT_REPAIR_OBJECTIVE_REL_TOL = 5.0e-6
 # Model-to-model optimal-value comparison tolerance. This is intentionally
 # separate from the MIP gap and from the objective-recomputation tolerance.
 DEFAULT_MODEL_MATCH_ABS_TOL = 1.0e-4
-DEFAULT_MODEL_MATCH_REL_TOL = 0.002        # 0.2 percent; twice default MIP gap
+DEFAULT_MODEL_MATCH_REL_TOL = 0.001        # 0.1 percent; twice default MIP gap
 
 DEFAULT_FEASIBILITY_ABS_TOL = 1.0e-6
 DEFAULT_FEASIBILITY_REL_TOL = 1.0e-8

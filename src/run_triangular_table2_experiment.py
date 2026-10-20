@@ -78,7 +78,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 DEFAULT_SOLVER = "GUROBI"                  # CPLEX, MOSEK, GUROBI, BOTH, or ALL
 SOLVER_NAMES = ("CPLEX", "MOSEK", "GUROBI")
 DEFAULT_TIME_LIMIT_SECONDS = 3600.0       # Table 2: one hour per model
-DEFAULT_MIP_GAP = 0.001                   # Table 2: 0.1 percent
+DEFAULT_MIP_GAP = 0.0005                  # Table 2: 0.05 percent
 DEFAULT_THREADS = 1                       # Reproducible/fair default
 DEFAULT_N_VALUES = "100,200,300,400,500,600,700"
 DEFAULT_REPLICATIONS = "1-30"
@@ -104,7 +104,7 @@ DEFAULT_REPAIR_OBJECTIVE_REL_TOL = 5.0e-6
 # Model-to-model optimal-value comparison tolerance. This is intentionally
 # separate from the MIP gap and from the objective-recomputation tolerance.
 DEFAULT_MODEL_MATCH_ABS_TOL = 1.0e-4
-DEFAULT_MODEL_MATCH_REL_TOL = 0.002        # 0.2 percent; twice default MIP gap
+DEFAULT_MODEL_MATCH_REL_TOL = 0.001        # 0.1 percent; twice default MIP gap
 
 DEFAULT_FEASIBILITY_ABS_TOL = 1.0e-6
 DEFAULT_FEASIBILITY_REL_TOL = 1.0e-8
@@ -115,14 +115,12 @@ TABLE2_REPLICATIONS = tuple(range(1, 31))
 
 BIGM_MODEL_ID = "CURRENT_TRIANGULAR_BIGM_FIXED_COST"
 PERSPECTIVE_MODEL_ID = "CURRENT_TRIANGULAR_PERSPECTIVE_FIXED_COST"
-# The perspective model plus the manuscript revision's valid inequality
-# (15i); the revision renumbers (9) -> (15) and (5) -> (11), so its
-# "(15c) replaced by (11)" is PERSPECTIVE_MODEL_ID above.
-PERSPECTIVE_BOUNDED_MODEL_ID = "CURRENT_TRIANGULAR_PERSPECTIVE_15I_FIXED_COST"
+# Disabled experimental model ID:
+# PERSPECTIVE_WITH_15I_MODEL_ID = "CURRENT_TRIANGULAR_PERSPECTIVE_FIXED_COST_WITH_15I"
 MODEL_LABELS = {
     BIGM_MODEL_ID: "Big-M (9)",
-    PERSPECTIVE_MODEL_ID: "Conic (9) with (9c) replaced by (5)",
-    PERSPECTIVE_BOUNDED_MODEL_ID: "Conic perspective + (15i)",
+    PERSPECTIVE_MODEL_ID: "Perspective",
+    # PERSPECTIVE_WITH_15I_MODEL_ID: "Perspective with (15i)",
 }
 
 EXPECTED_GENERATION_VERSION = "TABLES_1_3_CORRECTED_STAGE1_V1"
@@ -269,12 +267,14 @@ def parse_models(text: str) -> tuple[str, ...]:
         "bigm": (BIGM_MODEL_ID,),
         "perspective": (PERSPECTIVE_MODEL_ID,),
         "conic": (PERSPECTIVE_MODEL_ID,),
-        "perspective15i": (PERSPECTIVE_BOUNDED_MODEL_ID,),
-        "all": (BIGM_MODEL_ID, PERSPECTIVE_MODEL_ID, PERSPECTIVE_BOUNDED_MODEL_ID),
+        # Disabled experimental selectors:
+        # "perspective15i": (PERSPECTIVE_WITH_15I_MODEL_ID,),
+        # "perspective_with_15i": (PERSPECTIVE_WITH_15I_MODEL_ID,),
+        "all": (BIGM_MODEL_ID, PERSPECTIVE_MODEL_ID),
     }
     require(
         value in mapping,
-        "--models must be both, all, bigm, perspective, conic, or perspective15i",
+        "--models must be both, bigm, perspective, conic, or all",
     )
     return mapping[value]
 
@@ -523,6 +523,11 @@ def import_optimization_stack() -> tuple[Any, Any, Any]:
         tc.PERSPECTIVE_MODEL_ID == PERSPECTIVE_MODEL_ID,
         "triangular_current PERSPECTIVE_MODEL_ID drifted",
     )
+    # Disabled perspective-with-(15i) API drift check:
+    # require(
+    #     tc.PERSPECTIVE_WITH_15I_MODEL_ID == PERSPECTIVE_WITH_15I_MODEL_ID,
+    #     "triangular_current PERSPECTIVE_WITH_15I_MODEL_ID drifted",
+    # )
     return cp, np, tc
 
 
@@ -531,11 +536,13 @@ def build_current_manuscript_triangular_model(
 ) -> Any:
     _, _, tc = import_optimization_stack()
     require(model_id in MODEL_LABELS, f"unsupported model_id: {model_id}")
-    builder = {
+    builders = {
         BIGM_MODEL_ID: tc.build_current_triangular_bigm_fixed_cost,
         PERSPECTIVE_MODEL_ID: tc.build_current_triangular_perspective_fixed_cost,
-        PERSPECTIVE_BOUNDED_MODEL_ID: tc.build_current_triangular_perspective_bounded_fixed_cost,
-    }[model_id]
+        # PERSPECTIVE_WITH_15I_MODEL_ID:
+        #     tc.build_current_triangular_perspective_fixed_cost_with_15i,
+    }
+    builder = builders[model_id]
     bundle = builder(
         instance.a, instance.m, instance.b,
         instance.price_p, instance.cost_c, instance.salvage_s,
