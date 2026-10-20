@@ -29,7 +29,7 @@ generate_manuscript_table_instances.py.
 
 Usage:
 
-    python generate_strongly_correlated_uniform_instances.py --n-values all --replications all
+    python generate_uniform_strongly_correlated_instances.py --n-values all --replications all
 """
 
 from __future__ import annotations

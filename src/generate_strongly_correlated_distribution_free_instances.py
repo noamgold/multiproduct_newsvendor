@@ -1,7 +1,7 @@
 """Generate a harder-fixed-cost variant of the frozen Distribution-Free
 Table 3 instances (distribution_free_table3_instances.csv) -- the third
 sibling of generate_strongly_correlated_instances.py (Triangular) and
-generate_strongly_correlated_uniform_instances.py (Uniform).
+generate_uniform_strongly_correlated_instances.py (Uniform).
 
 See generate_strongly_correlated_instances.py's module docstring for the
 full background. In brief: the manuscript's equation (13) sets

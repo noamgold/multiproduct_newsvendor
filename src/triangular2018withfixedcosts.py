@@ -1,10 +1,9 @@
 """Solve Triangular fixed-cost instances with an MINLP solver -- Bonmin or
 SCIP, selectable via --minlp-solver / the DEFAULT_SOLVER global (see
 MINLP_SOLVER_CHOICES) -- using the un-lifted cubic MINLP formulation below
-(merged in from what was originally a separate module,
-triangular2018withfixedcosts.py), and compare its objective/node-count/
-CPU-time against GUROBI's results for the same instances -- for either of
-two datasets, selected by ``--dataset``:
+(including the formerly separate model implementation). It compares the
+objective, node count, and CPU time against GUROBI's results for the same
+instances, for either of two datasets selected by ``--dataset``:
 
 * "table2" (the default): the original manuscript (equation (13)) Table 2
   instances, triangular_table2_instances.csv. GUROBI's reference results
@@ -43,7 +42,7 @@ invariant the next time run_triangular_table2_experiment.py is run with
 per-(instance, model) row shape as a plain, non-append-only comparison
 table, upserted (not strictly appended) on every run of this script.
 
-Model background (merged from triangular2018withfixedcosts.py). Two
+Model background. Two
 formulations of essentially the same combinatorial problem already exist
 in this project:
 
@@ -127,10 +126,10 @@ inherits by default.
 
 Usage:
 
-    python run_triangular_cubic2018_bonmin_compare.py --n-values 100,200 --replications 1-30
-    python run_triangular_cubic2018_bonmin_compare.py --minlp-solver scip --n-values 100 --replications 1-5
-    python run_triangular_cubic2018_bonmin_compare.py --dataset strongly_correlated --n-values all --replications all
-    python run_triangular_cubic2018_bonmin_compare.py --self-test
+    python triangular2018withfixedcosts.py --n-values 100,200 --replications 1-30
+    python triangular2018withfixedcosts.py --minlp-solver scip --n-values 100 --replications 1-5
+    python triangular2018withfixedcosts.py --dataset strongly_correlated --n-values all --replications all
+    python triangular2018withfixedcosts.py --self-test
 """
 
 from __future__ import annotations
@@ -151,14 +150,14 @@ try:
     import pyomo.environ as pyo
 except ImportError as error:  # pragma: no cover - import guard only
     raise ImportError(
-        "run_triangular_cubic2018_bonmin_compare requires Pyomo to be installed (pip install pyomo)."
+        "triangular2018withfixedcosts requires Pyomo to be installed (pip install pyomo)."
     ) from error
 
 import generate_strongly_correlated_instances as gsc
 import run_triangular_table2_experiment as rte
 
 # ===========================================================================
-# Merged from triangular2018withfixedcosts.py: the un-lifted cubic MINLP
+# The un-lifted cubic MINLP
 # model Bonmin solves. See module docstring above for the model itself.
 # ===========================================================================
 
