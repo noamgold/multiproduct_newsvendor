@@ -24,7 +24,8 @@ in closed form, and the manuscript writes the resulting problem as a
 
 with the lambda term a variance penalty (lambda = 1e-9 in the Table 3
 instances). g_i is strictly convex, and x^U_i is its unconstrained
-minimizer. Formulation (11), big-M:
+minimizer. with_portfolio_variance_bound switches an instance to the
+portfolio variance bound, weights (p_i - s_i)^2 sigma_i^2 / mu_i^2. Formulation (11), big-M:
 
     min  sum_i theta_i + lambda sum_i (p_i - s_i)^2 sigma_i^2 x_i^2   (11a)
     s.t. (c_i-s_i)x_i + (p_i-s_i)(nu_i - x_i + mu_i)/2 <= theta_i     (11b')
@@ -137,6 +138,10 @@ class DistributionFreeInstance:
     capacity_fraction: float
     C: float
     generation_version: str
+    # Per-product penalty weights w_i in lambda * w_i * x_i^2. None means the
+    # stored instances' weights (p_i - s_i)^2 sigma_i^2; see
+    # with_portfolio_variance_bound for the portfolio weights.
+    variance_weight: tuple[float, ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -168,38 +173,94 @@ def df_profit(
     )
 
 
+def penalty_weights(instance: DistributionFreeInstance) -> tuple[float, ...]:
+    """w_i in the penalty lambda * w_i * x_i^2 of (11a)/(12)."""
+    if instance.variance_weight is not None:
+        return instance.variance_weight
+    return tuple(
+        (p - s) ** 2 * sigma**2
+        for p, s, sigma in zip(instance.price_p, instance.salvage_s, instance.sigma, strict=True)
+    )
+
+
+def _product_costs(instance: DistributionFreeInstance, q: Sequence[float]) -> list[float]:
+    """g_i(q_i) = theta_i(q_i) + lambda * w_i * q_i^2 for every product.
+    With the stored weights this is exactly the generator's df_g.
+    """
+    return [
+        gmti.df_theta(quantity, mu, sigma, p, c, s) + instance.lambda_ * weight * quantity**2
+        for quantity, mu, sigma, p, c, s, weight in zip(
+            q, instance.mu, instance.sigma, instance.price_p, instance.cost_c,
+            instance.salvage_s, penalty_weights(instance), strict=True,
+        )
+    ]
+
+
 def distribution_free_cost(instance: DistributionFreeInstance, q: Sequence[float]) -> float:
     """sum_i g_i(q_i): the objective (11a)/(12) reports, recomputed
     independently from the order quantities alone.
     """
-    return sum(
-        df_g(quantity, mu, sigma, instance.lambda_, p, c, s)
-        for quantity, mu, sigma, p, c, s in zip(
-            q, instance.mu, instance.sigma, instance.price_p, instance.cost_c,
-            instance.salvage_s, strict=True,
-        )
-    )
+    return sum(_product_costs(instance, q))
 
 
 def distribution_free_profit(instance: DistributionFreeInstance, q: Sequence[float]) -> float:
     """sum_i pi_i(q_i) = zero_quantity_cost(instance) - distribution_free_cost."""
     return sum(
-        df_profit(quantity, mu, sigma, instance.lambda_, p, c, s)
-        for quantity, mu, sigma, p, c, s in zip(
-            q, instance.mu, instance.sigma, instance.price_p, instance.cost_c,
-            instance.salvage_s, strict=True,
+        at_zero - at_q
+        for at_zero, at_q in zip(
+            _product_costs(instance, [0.0] * instance.n), _product_costs(instance, q), strict=True
         )
     )
 
 
 def zero_quantity_cost(instance: DistributionFreeInstance) -> float:
     """sum_i g_i(0) -- the constant separating the cost and profit scales."""
-    return sum(
-        df_g(0.0, mu, sigma, instance.lambda_, p, c, s)
-        for mu, sigma, p, c, s in zip(
-            instance.mu, instance.sigma, instance.price_p, instance.cost_c,
-            instance.salvage_s, strict=True,
+    return sum(_product_costs(instance, [0.0] * instance.n))
+
+
+def with_portfolio_variance_bound(
+    instance: DistributionFreeInstance, lambda_: float
+) -> DistributionFreeInstance:
+    """The same instance under the portfolio variance bound: penalty weights
+    w_i = (p_i - s_i)^2 sigma_i^2 / mu_i^2 and penalty parameter ``lambda_``.
+
+    Only x^U depends on the penalty, so it is recomputed (it is the big-M
+    constant of (11c)); mu, sigma, prices, k, K and C are kept as stored.
+    k and fixed_cost_score therefore remain the profit scores of the stored
+    model, whose penalty (lambda = 1e-9) is negligible.
+    """
+    require(lambda_ >= 0.0, "lambda must be nonnegative")
+    require(all(mu > 0.0 for mu in instance.mu), f"{instance.instance_id}: mu must be positive")
+    weights = tuple(
+        (p - s) ** 2 * sigma**2 / mu**2
+        for p, s, sigma, mu in zip(
+            instance.price_p, instance.salvage_s, instance.sigma, instance.mu, strict=True
         )
+    )
+    x_u = []
+    for mu, sigma, p, c, s, weight in zip(
+        instance.mu, instance.sigma, instance.price_p, instance.cost_c,
+        instance.salvage_s, weights, strict=True,
+    ):
+        def derivative(x: float) -> float:
+            return (c - s) + (p - s) / 2.0 * ((x - mu) / math.hypot(sigma, x - mu) - 1.0) + 2.0 * lambda_ * weight * x
+
+        if derivative(0.0) >= 0.0:
+            x_u.append(0.0)
+            continue
+        # g_i' is strictly increasing, so bisect on a bracket found by doubling.
+        low, high = 0.0, mu + sigma
+        while derivative(high) < 0.0:
+            high *= 2.0
+        for _ in range(200):
+            middle = 0.5 * (low + high)
+            if derivative(middle) < 0.0:
+                low = middle
+            else:
+                high = middle
+        x_u.append(0.5 * (low + high))
+    return dataclasses.replace(
+        instance, lambda_=float(lambda_), variance_weight=weights, x_u=tuple(x_u)
     )
 
 
@@ -401,7 +462,7 @@ def build_current_manuscript_distribution_free_model(
             cp.SOC(u[i] + multiplier, cp.hstack([2.0 * x[i], u[i] - multiplier]))
         )
 
-    penalty = instance.lambda_ * spread**2 * sigma**2
+    penalty = instance.lambda_ * np.asarray(penalty_weights(instance), dtype=float)
     objective_expression = cp.sum(theta) + penalty @ u
     problem = cp.Problem(cp.Minimize(objective_expression), constraints)
 

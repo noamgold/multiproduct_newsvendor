@@ -12,12 +12,36 @@ The three panels use:
 * a rolling 20-week training window; and
 * a rolling 10-week training window.
 
+Variance penalty.  ``--variance-bound portfolio`` (the default) weights the
+penalty by ``((p-s)*sigma/mu)**2``.  For nonnegative demand with mean mu > 0,
+Var(min(D, x)) <= (sigma/mu)**2 * x**2, so with independent demands the
+penalty sum_i ((p_i-s_i)*sigma_i/mu_i)**2 * x_i**2 is the variance of the
+portfolio sum_i (p_i-s_i) x_i D_i/mu_i and an upper bound on the profit
+variance.  ``--variance-bound sigma2`` restores the original weights
+``((p-s)*sigma)**2`` of the submitted manuscript's Figure 1.
+
+Costs and salvage values.  ``--cost-model random`` (the default) follows
+Section 6.2: c_i = p_i * U[10/14, 10/11] and s_i = c_i * U[-0.9, 0.9], drawn
+once per product from ``--cost-seed`` and shared by every scheme, window and
+model.  ``--cost-model fixed`` restores the Julia driver's c_i = p_i/1.9 and
+s_i = 0.4 c_i.
+
+Distribution-free solves use the Lagrangian (dual) cut method of
+submodular_cuts.py by default (``--df-method cuts``); ``--df-method misocp``
+solves the perspective MISOCP (20) directly with Gurobi, which can stall on
+numerical issues for intermediate lambda.
+
 For every distribution-free solve, the script stores scalar CSV summaries only:
 
 * ``sum_theta = sum(theta)``;
-* ``lambda_coefficient = sum(((p-s)*sigma)**2 * u)``; and
+* ``lambda_coefficient = sum(weights * u)`` with the weights above; and
 * the objective decomposition
   ``sum_theta + lambda * lambda_coefficient``.
+
+Each panel also solves lambda = 0 (the Gallego-Moon model), drawn as a dashed
+reference line, and records the data-dependent upper bound lambda_max of
+Section 5.4 (with epsilon = C/n) for every training window; the median over
+windows is drawn as a vertical line.
 
 The full ``x``, ``theta``, ``u``, ``z``, and ``x_u`` vectors exist only in
 memory while a solve is processed and are never written to disk.
@@ -29,14 +53,18 @@ resumes from completed scalar CSV records.
 Typical commands
 ----------------
 
-Full reproduction from Processed_Online_Retail.xlsx located next to this file
-or in the sibling manuscript folder::
+Full run with the portfolio variance bound, from Processed_Online_Retail.xlsx
+located next to this file or in the sibling data folder::
 
     python rebuild_figure1.py
 
+Original (submitted) Figure 1 weights::
+
+    python rebuild_figure1.py --variance-bound sigma2
+
 Short verification run (one panel, one lambda, one rolling window)::
 
-    python rebuild_figure1.py --schemes increasing --lambdas 5e-10 --max-windows 1
+    python rebuild_figure1.py --schemes increasing --lambdas 1e-6 --max-windows 1
 
 Recreate the plot directly from the original Julia summary workbooks::
 
@@ -63,7 +91,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-LAMBDA_VALUES = (
+SIGMA2_LAMBDA_VALUES = (
     1e-13,
     2.5e-13,
     5e-13,
@@ -94,6 +122,32 @@ LAMBDA_VALUES = (
     7.5e-7,
     1e-6,
 )
+
+# The portfolio weights are the sigma2 weights divided by mu**2 (median mu is
+# about 20 units/week), and lambda_max is O(1) for these data, so the grid is
+# shifted up and extended to cover [0, lambda_max].
+PORTFOLIO_LAMBDA_VALUES = tuple(
+    mantissa * 10.0**exponent
+    for exponent in range(-9, 1)
+    for mantissa in (1.0, 2.5, 5.0)
+) + (10.0,)
+
+VARIANCE_BOUNDS = ("portfolio", "sigma2")
+DEFAULT_LAMBDA_VALUES: Mapping[str, tuple[float, ...]] = {
+    "portfolio": PORTFOLIO_LAMBDA_VALUES,
+    "sigma2": SIGMA2_LAMBDA_VALUES,
+}
+
+COST_MODELS = ("random", "fixed")
+DEFAULT_COST_SEED = 20261022
+COST_FACTOR_RANGE = (10.0 / 14.0, 10.0 / 11.0)
+SALVAGE_FACTOR_RANGE = (-0.9, 0.9)
+
+
+def default_output_directory(variance_bound: str, cost_model: str) -> str:
+    if (variance_bound, cost_model) == ("sigma2", "fixed"):
+        return "figure1_python_results"
+    return f"figure1_{variance_bound}_{cost_model}_results"
 
 MIP_GAP = 0.0001
 TIME_LIMIT_SECONDS = 3.0 * 3600.0
@@ -153,6 +207,13 @@ DD_RECORD_FIELDS = (
     "sum_x",
     "objective_solver",
     "test_loss",
+)
+
+WINDOW_RECORD_FIELDS = (
+    "scheme",
+    "train_begin_week",
+    "train_end_week",
+    "lambda_max",
 )
 
 LAMBDA_SUMMARY_FIELDS = (
@@ -266,6 +327,74 @@ def training_parameters(demand_train: np.ndarray) -> tuple[np.ndarray, np.ndarra
     return b, mu, sigma
 
 
+def economic_parameters(
+    price: np.ndarray, cost_model: str, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (cost, salvage) per product.
+
+    ``random`` (Section 6.2): c_i = p_i * U[10/14, 10/11], s_i = c_i * U[-0.9, 0.9],
+    drawn once per product in product order from ``seed``.
+    ``fixed``: the Julia driver's c_i = p_i / 1.9, s_i = 0.4 c_i.
+    """
+    if cost_model == "fixed":
+        cost = price / 1.9
+        return cost, cost * 0.4
+    require(cost_model == "random", f"unknown cost model {cost_model!r}")
+    rng = np.random.default_rng(seed)
+    cost = price * rng.uniform(*COST_FACTOR_RANGE, size=price.shape)
+    salvage = cost * rng.uniform(*SALVAGE_FACTOR_RANGE, size=price.shape)
+    return cost, salvage
+
+
+def variance_weights(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    price: np.ndarray,
+    salvage: np.ndarray,
+    variance_bound: str,
+) -> np.ndarray:
+    """Penalty weights w_i of the term lambda * sum_i w_i * x_i**2.
+
+    ``portfolio``: w_i = ((p_i-s_i)*sigma_i/mu_i)**2, the variance of the
+    mean-normalized portfolio, which bounds the newsvendor profit variance.
+    A product with mu_i = 0 never sold in the window (demand is nonnegative),
+    so sigma_i = 0 and its weight is 0.
+    ``sigma2``: w_i = ((p_i-s_i)*sigma_i)**2, the submitted manuscript's weights.
+    """
+    spread = price - salvage
+    if variance_bound == "sigma2":
+        return (spread * sigma) ** 2
+    require(variance_bound == "portfolio", f"unknown variance bound {variance_bound!r}")
+    require(bool(np.all(sigma[mu <= 0.0] <= 1e-14)), "positive sigma with nonpositive mean")
+    safe_mu = np.where(mu > 0.0, mu, 1.0)
+    return np.where(mu > 0.0, (spread * sigma / safe_mu) ** 2, 0.0)
+
+
+def lambda_upper_bound(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    price: np.ndarray,
+    cost: np.ndarray,
+    salvage: np.ndarray,
+    lambda_weights: np.ndarray,
+    epsilon: float,
+) -> float:
+    """lambda_max of Section 5.4: for lambda >= lambda_max every product's
+    marginal cost at x = epsilon is nonnegative, so x* <= epsilon.
+
+    Products with zero weight cannot be driven to zero by the penalty and are
+    excluded, matching the restriction to sigma_i > 0 in the manuscript.
+    """
+    spread = price - salvage
+    radius = np.sqrt(sigma**2 + (epsilon - mu) ** 2)
+    radius = np.where(radius > 0.0, radius, 1.0)
+    numerator = np.maximum(spread / 2.0 * (1.0 + (mu - epsilon) / radius) - (cost - salvage), 0.0)
+    penalized = lambda_weights > 0.0
+    if not np.any(penalized):
+        return math.inf
+    return float(np.max(numerator[penalized] / (2.0 * lambda_weights[penalized] * epsilon)))
+
+
 def loss_function(
     demand: np.ndarray,
     x: np.ndarray,
@@ -287,11 +416,18 @@ def solve_data_driven(
     salvage: np.ndarray,
     capacity: float,
     args: argparse.Namespace,
+    *,
+    fixed_costs: np.ndarray | None = None,
+    budget: float = FIXED_COST_BUDGET,
 ) -> dict[str, Any]:
-    """Solve empirical formulation (20), translated from mpnv_DD.jl."""
+    """Solve empirical formulation (23), translated from mpnv_DD.jl.
+
+    ``fixed_costs`` defaults to k_i = FIXED_COST for every product.
+    """
     import gurobipy as gp
 
     n, periods = demand_train.shape
+    k = np.full(n, FIXED_COST) if fixed_costs is None else fixed_costs
     model = gp.Model("figure1_data_driven")
     model.Params.OutputFlag = 1 if args.verbose_solver else 0
     model.Params.MIPGap = args.mip_gap
@@ -312,7 +448,7 @@ def solve_data_driven(
         gp.GRB.MINIMIZE,
     )
     model.addConstr(x.sum() <= capacity, name="capacity")
-    model.addConstr(FIXED_COST * z.sum() <= FIXED_COST_BUDGET, name="fixed_cost_budget")
+    model.addConstr(k @ z <= budget, name="fixed_cost_budget")
     model.addConstr(x <= b * z, name="selection_link")
     for period in range(periods):
         model.addConstr(underage[:, period] >= demand_train[:, period] - x)
@@ -332,6 +468,7 @@ def solve_distribution_free(
     mu: np.ndarray,
     sigma: np.ndarray,
     lambda_value: float,
+    lambda_weights: np.ndarray,
     price: np.ndarray,
     cost: np.ndarray,
     salvage: np.ndarray,
@@ -339,11 +476,14 @@ def solve_distribution_free(
     args: argparse.Namespace,
     *,
     x_u: np.ndarray,
+    fixed_costs: np.ndarray | None = None,
+    budget: float = FIXED_COST_BUDGET,
 ) -> dict[str, Any]:
-    """Solve the fixed-cost version of formulation (17) with Gurobi."""
+    """Solve the perspective formulation (20) with Gurobi."""
     import gurobipy as gp
 
     n = len(mu)
+    k = np.full(n, FIXED_COST) if fixed_costs is None else fixed_costs
     model = gp.Model("figure1_distribution_free")
     model.Params.OutputFlag = 1 if args.verbose_solver else 0
     model.Params.MIPGap = args.mip_gap
@@ -356,10 +496,9 @@ def solve_distribution_free(
     u = model.addMVar(n, lb=0.0, name="u")
     z = model.addMVar(n, vtype=gp.GRB.BINARY, name="z")
     model.addConstr(x <= x_u * z, name="selection_link")
-    model.addConstr(FIXED_COST * z.sum() <= FIXED_COST_BUDGET, name="fixed_cost_budget")
+    model.addConstr(k @ z <= budget, name="fixed_cost_budget")
 
     spread = price - salvage
-    lambda_weights = (spread * sigma) ** 2
     model.setObjective(theta.sum() + lambda_value * (lambda_weights @ u), gp.GRB.MINIMIZE)
     model.addConstr(x.sum() <= capacity, name="capacity")
     model.addConstr(
@@ -403,10 +542,107 @@ def solve_distribution_free(
     }
 
 
+def distribution_free_theta(
+    x: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    price: np.ndarray,
+    cost: np.ndarray,
+    salvage: np.ndarray,
+) -> np.ndarray:
+    """theta_i(x_i) of (19b), the Gallego-Moon expected-cost bound."""
+    radius = np.sqrt(sigma**2 + (x - mu) ** 2)
+    return (cost - salvage) * x + (price - salvage) * (radius - x + mu) / 2.0
+
+
+def solve_distribution_free_cuts(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    lambda_value: float,
+    lambda_weights: np.ndarray,
+    price: np.ndarray,
+    cost: np.ndarray,
+    salvage: np.ndarray,
+    capacity: float,
+    args: argparse.Namespace,
+    *,
+    x_u: np.ndarray,
+    fixed_costs: np.ndarray | None = None,
+    budget: float = FIXED_COST_BUDGET,
+) -> dict[str, Any]:
+    """Solve (19) with the Lagrangian (dual) cut method of submodular_cuts.
+
+    Products with x^U_i = 0 never order anything and are left out of the cut
+    master; in these data they are exactly the products with no sales in the
+    training window (mu_i = sigma_i = 0), which the oracle cannot represent.
+    The cut solver maximizes the profit sum_i g_i(0) - g_i(x_i); the cost
+    objective of (19) is recovered by subtracting it from sum_i g_i(0).
+    """
+    import submodular_cuts
+
+    n = len(mu)
+    k = np.full(n, FIXED_COST) if fixed_costs is None else fixed_costs
+    active = x_u > 0.0
+    require(
+        bool(np.all((sigma[active] > 0.0) & (mu[active] > 0.0))),
+        "a product with positive x^U has zero mean or zero standard deviation",
+    )
+    quantities = np.zeros(n, dtype=float)
+    status = "optimal"
+    solve_time = 0.0
+    profit = 0.0
+    if np.any(active):
+        result = submodular_cuts.solve_distribution_free_fixed_cost_submodular_cuts(
+            mu[active],
+            sigma[active],
+            lambda_value,
+            price[active],
+            cost[active],
+            salvage[active],
+            x_u[active],
+            k[active],
+            capacity,
+            budget,
+            variance_weight=lambda_weights[active],
+            time_limit_seconds=args.time_limit,
+            mip_gap=args.mip_gap,
+            threads=args.threads if args.threads is not None else 1,
+            verbose=args.verbose_solver,
+        )
+        require(
+            result.status in ("optimal", "time_limit") and result.quantities is not None,
+            f"distribution-free cut solve ended with status {result.status}",
+        )
+        status = result.status
+        solve_time = result.solve_seconds
+        profit = float(result.objective)
+        quantities[active] = result.quantities
+
+    theta = distribution_free_theta(quantities, mu, sigma, price, cost, salvage)
+    sum_theta = float(np.sum(theta))
+    lambda_coefficient = float(lambda_weights @ quantities**2)
+    zero_cost = float(np.sum(distribution_free_theta(np.zeros(n), mu, sigma, price, cost, salvage)))
+    objective = zero_cost - profit
+    reconstructed = sum_theta + lambda_value * lambda_coefficient
+    require(
+        abs(objective - reconstructed) <= 1e-6 * max(1.0, abs(objective)),
+        f"cut-method objective decomposition failed: solver={objective}, reconstructed={reconstructed}",
+    )
+    return {
+        "status": status,
+        "x": quantities,
+        "sum_theta": sum_theta,
+        "lambda_coefficient": lambda_coefficient,
+        "objective": objective,
+        "solve_time": solve_time,
+    }
+
+
 def distribution_free_unconstrained_quantities(
     mu: np.ndarray,
     sigma: np.ndarray,
     lambda_value: float,
+    lambda_weights: np.ndarray,
     price: np.ndarray,
     cost: np.ndarray,
     salvage: np.ndarray,
@@ -419,8 +655,6 @@ def distribution_free_unconstrained_quantities(
     by objective coefficients as small as 1e-13.
     """
     started = time.perf_counter()
-    spread = price - salvage
-    lambda_weights = (spread * sigma) ** 2
     quantities = np.zeros_like(mu, dtype=float)
 
     for index in range(len(mu)):
@@ -531,22 +765,37 @@ def run_scheme(
     scheme_directory = output_root / scheme
     df_csv = scheme_directory / "distribution_free_solutions.csv"
     dd_csv = scheme_directory / "data_driven_solutions.csv"
+    window_csv = scheme_directory / "windows.csv"
     summary_csv = scheme_directory / "lambda_summary.csv"
     training_ends = selected_training_ends(initial_window, data.week_count, args.max_windows)
 
     price = data.unit_prices
-    cost = price / 1.9
-    salvage = cost * 0.4
+    cost, salvage = economic_parameters(price, args.cost_model, args.cost_seed)
     capacity = CAPACITY_FRACTION * float(np.sum(np.mean(data.demand, axis=1)))
+    epsilon = capacity / data.product_count
 
     df_done = load_csv_records(df_csv, ("lambda", "train_end_week")) if args.resume else {}
     dd_done = load_csv_records(dd_csv, ("train_end_week",)) if args.resume else {}
+    window_done = load_csv_records(window_csv, ("train_end_week",)) if args.resume else {}
 
     for train_end in training_ends:
         train_begin = max(1, train_end - train_size + 1)
         demand_train = data.demand[:, train_begin - 1 : train_end]
         demand_test = data.demand[:, train_end]
         b, mu, sigma = training_parameters(demand_train)
+        lambda_weights = variance_weights(mu, sigma, price, salvage, args.variance_bound)
+
+        if (str(train_end),) not in window_done:
+            window_record = {
+                "scheme": scheme,
+                "train_begin_week": train_begin,
+                "train_end_week": train_end,
+                "lambda_max": lambda_upper_bound(
+                    mu, sigma, price, cost, salvage, lambda_weights, epsilon
+                ),
+            }
+            append_csv_record(window_csv, WINDOW_RECORD_FIELDS, window_record)
+            window_done[(str(train_end),)] = {key: str(value) for key, value in window_record.items()}
 
         dd_key = (str(train_end),)
         if dd_key not in dd_done:
@@ -577,15 +826,18 @@ def run_scheme(
                 mu,
                 sigma,
                 lambda_value,
+                lambda_weights,
                 price,
                 cost,
                 salvage,
             )
             x_u = unconstrained["x"]
-            solved = solve_distribution_free(
+            solve = solve_distribution_free_cuts if args.df_method == "cuts" else solve_distribution_free
+            solved = solve(
                 mu,
                 sigma,
                 lambda_value,
+                lambda_weights,
                 price,
                 cost,
                 salvage,
@@ -623,6 +875,19 @@ def run_scheme(
         df_csv,
         dd_csv,
         summary_csv,
+    )
+    lambda_max_values = [float(window_done[(str(end),)]["lambda_max"]) for end in training_ends]
+    write_csv(
+        scheme_directory / "lambda_max_summary.csv",
+        ("Scheme", "Median_Lambda_Max", "Min_Lambda_Max", "Max_Lambda_Max"),
+        [
+            {
+                "Scheme": scheme,
+                "Median_Lambda_Max": float(np.median(lambda_max_values)),
+                "Min_Lambda_Max": min(lambda_max_values),
+                "Max_Lambda_Max": max(lambda_max_values),
+            }
+        ],
     )
     return summary_csv
 
@@ -705,13 +970,29 @@ def read_original_summaries(directory: Path) -> dict[str, list[dict[str, float]]
     return summaries
 
 
-def plot_figure(summaries: Mapping[str, Sequence[Mapping[str, float]]], output_root: Path) -> None:
+def read_lambda_max(path: Path) -> float | None:
+    if not path.is_file():
+        return None
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    return float(rows[0]["Median_Lambda_Max"]) if rows else None
+
+
+def plot_figure(
+    summaries: Mapping[str, Sequence[Mapping[str, float]]],
+    output_root: Path,
+    lambda_max: Mapping[str, float | None] | None = None,
+) -> None:
     _, plt = require_plot_dependencies()
     schemes = [name for name in SCHEME_SPECS if name in summaries]
     require(schemes, "there are no summaries to plot")
     figure, axes = plt.subplots(1, len(schemes), figsize=(11.5, 3.25), squeeze=False)
     for axis, scheme in zip(axes[0], schemes):
-        rows = sorted(summaries[scheme], key=lambda row: row["Lambda"])
+        rows = sorted(
+            (row for row in summaries[scheme] if row["Lambda"] > 0.0),
+            key=lambda row: row["Lambda"],
+        )
+        zero_rows = [row for row in summaries[scheme] if row["Lambda"] == 0.0]
         lambdas = [row["Lambda"] for row in rows]
         data_driven = [row["Data_driven"] for row in rows]
         distribution_free = [row["Distribution_free"] for row in rows]
@@ -722,7 +1003,7 @@ def plot_figure(summaries: Mapping[str, Sequence[Mapping[str, float]]], output_r
             marker="o",
             markersize=2.7,
             linewidth=1.25,
-            label="Data driven",
+            label="Data-driven",
         )
         axis.plot(
             lambdas,
@@ -731,15 +1012,32 @@ def plot_figure(summaries: Mapping[str, Sequence[Mapping[str, float]]], output_r
             marker="o",
             markersize=2.7,
             linewidth=1.25,
-            label="Distribution free",
+            label="Distribution-free",
         )
+        if zero_rows:
+            axis.axhline(
+                zero_rows[0]["Distribution_free"],
+                color="#e76f51",
+                linestyle="--",
+                linewidth=0.9,
+                label=r"Distribution-free, $\lambda=0$",
+            )
+        scheme_lambda_max = (lambda_max or {}).get(scheme)
+        if scheme_lambda_max is not None and lambdas and scheme_lambda_max <= 10.0 * lambdas[-1]:
+            axis.axvline(
+                scheme_lambda_max,
+                color="0.35",
+                linestyle=":",
+                linewidth=1.0,
+                label=r"median $\lambda_{\max}$",
+            )
         axis.set_xscale("log")
-        axis.set_xlim(1e-13, 1e-6)
+        axis.set_xlim(lambdas[0], lambdas[-1])
         axis.set_xlabel(r"$\lambda$", labelpad=0)
         axis.set_title(SCHEME_SPECS[scheme][2], y=-0.34, fontsize=10)
         axis.grid(True, which="major", alpha=0.18, linewidth=0.5)
         axis.tick_params(axis="both", labelsize=7)
-        axis.legend(loc="upper right", fontsize=6.5, frameon=True)
+        axis.legend(loc="upper left", fontsize=6.5, frameon=True)
     figure.subplots_adjust(left=0.065, right=0.995, top=0.98, bottom=0.31, wspace=0.24)
     output_root.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_root / "figure1_rebuilt.pdf", bbox_inches="tight")
@@ -755,9 +1053,9 @@ def parse_schemes(text: str) -> tuple[str, ...]:
     return values
 
 
-def parse_lambdas(text: str) -> tuple[float, ...]:
+def parse_lambdas(text: str, variance_bound: str) -> tuple[float, ...]:
     if text.strip().lower() == "all":
-        return LAMBDA_VALUES
+        return DEFAULT_LAMBDA_VALUES[variance_bound]
     try:
         values = tuple(float(part.strip()) for part in text.split(",") if part.strip())
     except ValueError as error:
@@ -770,7 +1068,36 @@ def build_parser() -> argparse.ArgumentParser:
     script_directory = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=default_retail_workbook())
-    parser.add_argument("--output-dir", type=Path, default=script_directory / "figure1_python_results")
+    parser.add_argument(
+        "--variance-bound",
+        choices=VARIANCE_BOUNDS,
+        default="portfolio",
+        help="portfolio: weights ((p-s)*sigma/mu)**2 (default); sigma2: the submitted manuscript's ((p-s)*sigma)**2",
+    )
+    parser.add_argument(
+        "--cost-model",
+        choices=COST_MODELS,
+        default="random",
+        help="random: c = p*U[10/14,10/11], s = c*U[-0.9,0.9] as in Section 6.2 (default); fixed: c = p/1.9, s = 0.4c",
+    )
+    parser.add_argument("--cost-seed", type=int, default=DEFAULT_COST_SEED)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="default: figure1_<variance-bound>_<cost-model>_results next to this script",
+    )
+    parser.add_argument(
+        "--df-method",
+        choices=("cuts", "misocp"),
+        default="cuts",
+        help="cuts: Lagrangian (dual) cut method (default); misocp: perspective MISOCP (20) solved by Gurobi",
+    )
+    parser.add_argument(
+        "--no-zero-lambda",
+        dest="zero_lambda",
+        action="store_false",
+        help="skip the lambda = 0 (Gallego-Moon) reference solves",
+    )
     parser.add_argument("--plot-only-from", type=Path, help="directory containing the three original Julia summary XLSX files")
     parser.add_argument("--schemes", default="all", help="all or a comma list from: increasing,20,10")
     parser.add_argument("--lambdas", default="all", help="all or a comma-separated list")
@@ -782,7 +1109,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--verbose-solver", action="store_true")
-    parser.set_defaults(resume=True)
+    parser.set_defaults(resume=True, zero_lambda=True)
     return parser
 
 
@@ -794,6 +1121,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         require(args.threads >= 1, "threads must be positive")
     if args.max_windows is not None:
         require(args.max_windows >= 1, "max-windows must be positive")
+    if args.output_dir is None:
+        args.output_dir = Path(__file__).resolve().parent / default_output_directory(
+            args.variance_bound, args.cost_model
+        )
 
     if args.plot_only_from is not None:
         plot_figure(read_original_summaries(args.plot_only_from.resolve()), args.output_dir.resolve())
@@ -801,7 +1132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     schemes = parse_schemes(args.schemes)
-    lambda_values = parse_lambdas(args.lambdas)
+    lambda_values = parse_lambdas(args.lambdas, args.variance_bound)
+    if args.zero_lambda:
+        lambda_values = (0.0,) + lambda_values
     require(args.solver.upper() == "GUROBI", "this Julia-equivalent implementation requires GUROBI")
     try:
         import gurobipy  # noqa: F401
@@ -811,7 +1144,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Loaded {data.product_count} products and {data.week_count} weeks from {args.input.resolve()}")
     output_root = args.output_dir.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    metadata_path = output_root / "run_metadata.json"
+    run_settings = {
+        "variance_bound": args.variance_bound,
+        "cost_model": args.cost_model,
+        "cost_seed": args.cost_seed if args.cost_model == "random" else None,
+    }
+    if args.resume and metadata_path.is_file():
+        previous = json.loads(metadata_path.read_text(encoding="utf-8"))
+        previous_settings = {
+            "variance_bound": previous.get("variance_bound", "sigma2"),
+            "cost_model": previous.get("cost_model", "fixed"),
+            "cost_seed": previous.get("cost_seed"),
+        }
+        require(
+            previous_settings == run_settings,
+            f"{output_root} holds results for {previous_settings}; "
+            "use another --output-dir or --no-resume",
+        )
     metadata = {
+        **run_settings,
+        "df_method": args.df_method,
         "source_julia": "Loss Function - sens_ anal_lambda_T_train_k=1.jl",
         "input": str(args.input.resolve()),
         "product_count": data.product_count,
@@ -827,9 +1180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fixed_cost_budget": FIXED_COST_BUDGET,
         "julia_zero_padding_preserved": True,
     }
-    (output_root / "run_metadata.json").write_text(
-        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-    )
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
     summary_paths = {
         scheme: run_scheme(scheme, data, lambda_values, output_root, args)
@@ -837,7 +1188,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     if not args.no_plot:
         summaries = {scheme: read_csv_summary(path) for scheme, path in summary_paths.items()}
-        plot_figure(summaries, output_root)
+        lambda_max = {
+            scheme: read_lambda_max(path.parent / "lambda_max_summary.csv")
+            for scheme, path in summary_paths.items()
+        }
+        plot_figure(summaries, output_root, lambda_max)
     print(f"Results saved under {output_root}")
     return 0
 

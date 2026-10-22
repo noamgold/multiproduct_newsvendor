@@ -495,6 +495,11 @@ class DistributionFreeCapacityOracle(CapacityOracle):
     ``coeff_lin`` is pi_i'(0) = -g_i'(0), the marginal profit of the first
     unit -- the same role (p-c) plays in the other two oracles, and the
     multiplier at or above which product i orders nothing.
+
+    ``variance_weight`` replaces the penalty weight (p-s)^2 sigma^2 by any
+    nonnegative per-product w_i, e.g. the portfolio variance bound
+    (p-s)^2 sigma^2 / mu^2; g_i stays strictly convex, so nothing else
+    changes.
     """
 
     def __init__(
@@ -512,6 +517,7 @@ class DistributionFreeCapacityOracle(CapacityOracle):
         max_bisection_iterations: int = 100,
         feasibility_tol: float = 1.0e-9,
         response_iterations: int = 64,
+        variance_weight: Sequence[float] | None = None,
     ) -> None:
         _require(
             backend == "inline",
@@ -541,8 +547,16 @@ class DistributionFreeCapacityOracle(CapacityOracle):
         _require(self.C >= 0.0 and np.isfinite(self.C), "C must be finite and nonnegative")
 
         self.spread = self.price_p - self.salvage_s
+        if variance_weight is None:
+            self.variance_weight = self.spread**2 * self.sigma**2
+        else:
+            self.variance_weight = np.asarray(variance_weight, dtype=float)
+            _require(
+                self.variance_weight.shape == (self.n,) and bool(np.all(self.variance_weight >= 0.0)),
+                "variance_weight must be a nonnegative vector of length n",
+            )
         # Coefficient of x in g'(x), i.e. the derivative of the variance penalty.
-        self.penalty_slope = 2.0 * self.lambda_ * self.spread**2 * self.sigma**2
+        self.penalty_slope = 2.0 * self.lambda_ * self.variance_weight
         self.cost_zero = self._cost(np.zeros(self.n))
         # No linear segment: disables the marginal-gap tie-break, which
         # this family does not need (see the class docstring).
@@ -553,7 +567,7 @@ class DistributionFreeCapacityOracle(CapacityOracle):
         """g_i(x), vectorized."""
         radius = np.sqrt(self.sigma**2 + (x - self.mu) ** 2)
         theta = (self.cost_c - self.salvage_s) * x + self.spread * (radius - x + self.mu) / 2.0
-        return theta + self.lambda_ * self.spread**2 * self.sigma**2 * x**2
+        return theta + self.lambda_ * self.variance_weight * x**2
 
     def _cost_derivative(self, x: np.ndarray) -> np.ndarray:
         """g_i'(x), vectorized. Strictly increasing in x."""
@@ -765,11 +779,13 @@ def solve_distribution_free_fixed_cost_submodular_cuts(
     k: Sequence[float],
     C: float,
     K: float,
+    *,
+    variance_weight: Sequence[float] | None = None,
     **kwargs: Any,
 ) -> SubmodularCutSolveResult:
     """Distribution-free entry point (manuscript Table 3's model (11)/(12)).
     Identical master and cuts as the other two families -- see
-    DistributionFreeCapacityOracle.
+    DistributionFreeCapacityOracle, including for ``variance_weight``.
 
     NOTE ON SCALE: the returned ``objective`` is the PROFIT sum_i pi_i(x_i)
     = sum_i g_i(0) - sum_i g_i(x_i), not the cost that (11a)/(12)
@@ -780,7 +796,8 @@ def solve_distribution_free_fixed_cost_submodular_cuts(
     provides the constant).
     """
     oracle = DistributionFreeCapacityOracle(
-        mu, sigma, lambda_, price_p, cost_c, salvage_s, x_u, C
+        mu, sigma, lambda_, price_p, cost_c, salvage_s, x_u, C,
+        variance_weight=variance_weight,
     )
     return solve_fixed_cost_submodular_cuts(oracle, x_u, k, K, **kwargs)
 

@@ -54,6 +54,14 @@ Because (11)/(12) minimize, LOWER ``independent_objective`` is better:
 ``best_independent_objective`` is the minimum over the methods and
 ``shortfall_vs_best_rel`` = (own - best) / |best| >= 0.
 
+VARIANCE PENALTY
+----------------
+By default (--variance-bound portfolio) the penalty uses the portfolio
+variance bound, weights (p_i-s_i)^2 sigma_i^2 / mu_i^2, with lambda = 1e-4
+(--lambda); x^U is recomputed from the stored mu and sigma, and k, K and C
+are used as stored. --variance-bound sigma2 reproduces the stored model
+(weights (p_i-s_i)^2 sigma_i^2, lambda = 1e-9).
+
 Usage:
 
     python run_distribution_free_strongly_correlated.py --n-values 100 --replications 1-10
@@ -76,7 +84,20 @@ import submodular_cuts as tsc
 import triangular_current as tc
 
 DEFAULT_INSTANCES_CSV = gscd.DEFAULT_OUTPUT_CSV
-DEFAULT_RESULTS_CSV = "strongly_correlated_table3_results_with_cuts.csv"
+DEFAULT_RESULTS_CSV = {
+    "portfolio": "strongly_correlated_table3_portfolio_results_with_cuts.csv",
+    "sigma2": "strongly_correlated_table3_results_with_cuts.csv",
+}
+
+# Variance penalty. "portfolio" (default): weights (p-s)^2 sigma^2 / mu^2
+# with DEFAULT_PORTFOLIO_LAMBDA, x^U recomputed from the stored mu, sigma
+# (dft.with_portfolio_variance_bound); k, K and C are used as stored.
+# "sigma2": the stored instances' weights (p-s)^2 sigma^2 and lambda = 1e-9.
+# The portfolio weights are the sigma2 weights divided by mu^2, with mu
+# in [100, 500], so lambda = 1e-4 keeps the penalty at a comparable strength
+# and lies in the range that performed best in Figure 1.
+VARIANCE_BOUNDS = ("portfolio", "sigma2")
+DEFAULT_PORTFOLIO_LAMBDA = 1.0e-4
 
 # 0.05 percent for every method. See the module docstring on what that
 # means on each method's own objective scale.
@@ -104,6 +125,7 @@ METHOD_LABELS = {
 
 RESULT_FIELDNAMES = (
     "instance_id", "n", "replication", "method", "cut_family", "model_id", "solver",
+    "variance_bound", "lambda",
     "mip_gap_setting", "gap_scale",
     "status", "objective", "independent_objective", "independent_profit",
     "zero_quantity_cost",
@@ -245,6 +267,7 @@ def solve_cuts_and_collect_stats(
         instance.mu, instance.sigma, instance.lambda_,
         instance.price_p, instance.cost_c, instance.salvage_s,
         instance.x_u, instance.k, instance.C, instance.K,
+        variance_weight=instance.variance_weight,
         time_limit_seconds=time_limit_seconds,
         mip_gap=mip_gap,
         threads=threads,
@@ -357,8 +380,19 @@ def make_parser() -> argparse.ArgumentParser:
         help="relative optimality gap applied to every method (default 5e-4 = 0.05%%)",
     )
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
-    parser.add_argument("--instances-csv", default=DEFAULT_INSTANCES_CSV)
-    parser.add_argument("--results-csv", default=DEFAULT_RESULTS_CSV)
+    parser.add_argument(
+        "--instances-csv", default=DEFAULT_INSTANCES_CSV,
+        help="relative to this script's folder, falling back to ../data",
+    )
+    parser.add_argument(
+        "--variance-bound", choices=VARIANCE_BOUNDS, default="portfolio",
+        help="portfolio: weights (p-s)^2 sigma^2/mu^2 (default); sigma2: the stored instances' weights",
+    )
+    parser.add_argument(
+        "--lambda", dest="lambda_", type=float, default=DEFAULT_PORTFOLIO_LAMBDA,
+        help="penalty parameter for --variance-bound portfolio (sigma2 uses the stored 1e-9)",
+    )
+    parser.add_argument("--results-csv", help="default depends on --variance-bound")
     parser.add_argument(
         "--cut-family", choices=tsc.CUT_FAMILY_CHOICES, default=tsc.DEFAULT_CUT_FAMILY,
         help=(
@@ -422,11 +456,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     match_abs_tol, match_rel_tol = model_match_tolerances(args.mip_gap)
 
     base = Path(__file__).parent
+    instances_path = base / args.instances_csv
+    if not instances_path.exists():
+        instances_path = base.parent / "data" / args.instances_csv
     instances = gscd.read_selected_strongly_correlated_distribution_free_instances(
-        base / args.instances_csv, n_values, replications
+        instances_path, n_values, replications
     )
+    if args.variance_bound == "portfolio":
+        instances = [dft.with_portfolio_variance_bound(instance, args.lambda_) for instance in instances]
 
-    results_path = base / args.results_csv
+    results_path = base / (args.results_csv or DEFAULT_RESULTS_CSV[args.variance_bound])
     completed_keys: set[tuple[str, str, str]] = set()
     append_existing = args.resume and results_path.exists() and results_path.stat().st_size > 0
     if append_existing:
@@ -514,6 +553,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     # The cut master always runs on GUROBI (lazy-constraint
                     # callback); --solver only selects the MISOCP backend.
                     "solver": "GUROBI" if method == CUTS_METHOD else args.solver,
+                    "variance_bound": args.variance_bound,
+                    "lambda": instance.lambda_,
                     "mip_gap_setting": args.mip_gap,
                     "gap_scale": result["gap_scale"],
                     "status": result["status"],
