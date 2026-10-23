@@ -20,11 +20,10 @@ portfolio sum_i (p_i-s_i) x_i D_i/mu_i and an upper bound on the profit
 variance.  ``--variance-bound sigma2`` restores the original weights
 ``((p-s)*sigma)**2`` of the submitted manuscript's Figure 1.
 
-Costs and salvage values.  ``--cost-model random`` (the default) follows
-Section 6.2: c_i = p_i * U[10/14, 10/11] and s_i = c_i * U[-0.9, 0.9], drawn
-once per product from ``--cost-seed`` and shared by every scheme, window and
-model.  ``--cost-model fixed`` restores the Julia driver's c_i = p_i/1.9 and
-s_i = 0.4 c_i.
+Costs and salvage values.  ``--cost-model fixed`` (the default) uses the
+Julia driver's c_i = p_i/1.9 and s_i = 0.4 c_i.  ``--cost-model random``
+instead draws c_i = p_i * U[10/14, 10/11] and s_i = c_i * U[-0.9, 0.9] once per
+product from ``--cost-seed``, shared by every scheme, window and model.
 
 Distribution-free solves use the Lagrangian (dual) cut method of
 submodular_cuts.py by default (``--df-method cuts``); ``--df-method misocp``
@@ -1077,8 +1076,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cost-model",
         choices=COST_MODELS,
-        default="random",
-        help="random: c = p*U[10/14,10/11], s = c*U[-0.9,0.9] as in Section 6.2 (default); fixed: c = p/1.9, s = 0.4c",
+        default="fixed",
+        help="fixed: c = p/1.9, s = 0.4c (default); random: c = p*U[10/14,10/11], s = c*U[-0.9,0.9]",
     )
     parser.add_argument("--cost-seed", type=int, default=DEFAULT_COST_SEED)
     parser.add_argument(

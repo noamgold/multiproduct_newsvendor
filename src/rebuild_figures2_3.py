@@ -1,35 +1,40 @@
-"""Rebuild Figure 2 of Section 6.2 (predictive performance on the Online
-Retail data) and provide the machinery that rebuild_figure3.py reuses.
+"""Rebuild Figures 2 and 3 of Section 6.2 (predictive performance on the
+Online Retail data), the companions of rebuild_figure1.py.
 
-Both figures plot the average test loss (24) of three models over the same
+Both figures plot the average test loss (24) of four models over the same
 three rolling training schemes as Figure 1:
 
 * the uniform-demand model (12), with a = min and b = max of the training demands;
+* the triangular-demand model (17), with a and b as for the uniform model and
+  the mode from the triangular mean (a + m + b)/3 = sample mean, i.e.
+  m = 3*mean - a - b, clipped to [a + d, b - d] with d = 1e-6 * (b - a);
 * the data-driven model (23); and
 * the distribution-free model (19) with the portfolio variance bound,
   weights ((p-s)*sigma/mu)**2 and lambda = 1e-4 (``--lambda``).
 
 Figure 2 uses k_i = 1 and varies the fixed-cost budget K, i.e. the number of
-products stocked.  Figure 3 (rebuild_figure3.py) uses fixed costs correlated
-with profit as in (22): k_i = pi_i + epsilon, where pi_i is the expected
-profit at the unconstrained optimum of the distribution-free model with
-lambda = 0 (Gallego and Moon), estimated from the training window's mean and
-standard deviation, and K = kappa/101 * sum_i k_i for varying kappa.  The same
-k_i are used for all three models in a training window.
+products stocked.  Figure 3 uses fixed costs correlated with profit as in
+(22): k_i = pi_i + epsilon, where pi_i is the expected profit at the
+unconstrained optimum of the distribution-free model with lambda = 0
+(Gallego and Moon), estimated from the training window's mean and standard
+deviation, and K = kappa/101 * sum_i k_i for varying kappa.  The same k_i
+are used for all models in a training window.
 
 Costs, salvage values, capacity, schemes, and the loss follow
-rebuild_figure1.py exactly (``--cost-model random`` by default, Section 6.2).
-The uniform and distribution-free models are solved with the Lagrangian
-(dual) cut method of submodular_cuts.py, and the data-driven model as a MILP
-with Gurobi.  Products with no training-window sales (a = b = 0) never order
-and are left out of the cut masters; a product with constant positive
-training demand (a = b > 0) gets b = a + 1e-6 * max(1, a) so that the
-uniform model is defined.
+rebuild_figure1.py exactly (``--cost-model fixed`` by default: c_i = p_i/1.9,
+s_i = 0.4 c_i).
+The uniform, triangular and distribution-free models are solved with the
+Lagrangian (dual) cut method of submodular_cuts.py, and the data-driven model
+as a MILP with Gurobi.  Products with no training-window sales (a = b = 0)
+never order and are left out of the cut masters; a product with constant
+positive training demand (a = b > 0) gets b = a + 1e-6 * max(1, a) so that
+the uniform and triangular models are defined.
 
 Typical commands::
 
-    python rebuild_figure2.py
-    python rebuild_figure2.py --schemes 20 --levels 40 --max-windows 1
+    python rebuild_figures2_3.py --figure 2
+    python rebuild_figures2_3.py --figure 3
+    python rebuild_figures2_3.py --figure 2 --schemes 20 --levels 40 --max-windows 1
 
 Results are checkpointed per (level, training window, model) and resumed on
 re-run.
@@ -50,6 +55,7 @@ import rebuild_figure1 as f1
 DEFAULT_LAMBDA = 1.0e-4
 FIXED_COST_EPSILON = 1.0e-9
 UNIFORM_WIDENING = 1.0e-6
+TRIANGULAR_MODE_MARGIN = 1.0e-6
 DEFAULT_TIME_LIMIT_SECONDS = 600.0
 
 FIGURE_SPECS: Mapping[str, Mapping[str, Any]] = {
@@ -71,14 +77,16 @@ SCHEME_TITLES: Mapping[str, str] = {
     "10": r"(c) Using a fixed training set size $|T_{\mathrm{train}}|=10$",
 }
 
-MODELS = ("uniform", "data_driven", "distribution_free")
+MODELS = ("uniform", "triangular", "data_driven", "distribution_free")
 MODEL_LABELS = {
     "uniform": "Uniform",
+    "triangular": "Triangular",
     "data_driven": "Data-driven",
     "distribution_free": "Distribution-free",
 }
 MODEL_COLORS = {
     "uniform": "#1f77b4",
+    "triangular": "#8e5ea2",
     "data_driven": "#e76f51",
     "distribution_free": "#2a9d8f",
 }
@@ -103,6 +111,8 @@ SUMMARY_FIELDS = (
     "Level",
     "Uniform",
     "Uniform_Std",
+    "Triangular",
+    "Triangular_Std",
     "Data_driven",
     "DD_Std",
     "Distribution_free",
@@ -126,6 +136,62 @@ def uniform_inputs(
     b = np.where(constant, a + UNIFORM_WIDENING * np.maximum(1.0, a), b)
     x_u = np.where(b > a, a + (b - a) * (price - cost) / (price - salvage), 0.0)
     return a, b, x_u
+
+
+def triangular_mode(a: np.ndarray, b: np.ndarray, mean: np.ndarray) -> np.ndarray:
+    """Mode m with (a + m + b)/3 = mean, clipped to the open interval (a, b)
+    that the triangular model requires (a and b already widened, b > a, for
+    every product that can order)."""
+    margin = TRIANGULAR_MODE_MARGIN * (b - a)
+    return np.clip(3.0 * mean - a - b, a + margin, b - margin)
+
+
+def solve_triangular_cuts(
+    a: np.ndarray,
+    m: np.ndarray,
+    b: np.ndarray,
+    price: np.ndarray,
+    cost: np.ndarray,
+    salvage: np.ndarray,
+    capacity: float,
+    fixed_costs: np.ndarray,
+    budget: float,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Solve the triangular model (17) with the Lagrangian (dual) cut method.
+
+    x^U is the oracle's own unconstrained response, which is what the cut
+    solver validates against.
+    """
+    import submodular_cuts
+
+    quantities = np.zeros(len(a), dtype=float)
+    active = b > a
+    status, solve_time = "optimal", 0.0
+    if np.any(active):
+        oracle_inputs = (a[active], m[active], b[active], price[active], cost[active], salvage[active])
+        x_u = sum(
+            submodular_cuts.TriangularCapacityOracle(*oracle_inputs, capacity, backend="inline").response(0.0)
+        )
+        result = submodular_cuts.solve_triangular_fixed_cost_submodular_cuts(
+            *oracle_inputs,
+            x_u,
+            fixed_costs[active],
+            capacity,
+            budget,
+            oracle_backend="inline",
+            time_limit_seconds=args.time_limit,
+            mip_gap=args.mip_gap,
+            threads=args.threads,
+            verbose=args.verbose_solver,
+        )
+        require(
+            result.status in ("optimal", "time_limit") and result.quantities is not None,
+            f"triangular cut solve ended with status {result.status}",
+        )
+        status, solve_time = result.status, result.solve_seconds
+        quantities[active] = result.quantities
+    return {"status": status, "x": quantities, "solve_time": solve_time}
 
 
 def gallego_moon_profits(
@@ -233,6 +299,7 @@ def run_scheme(
         demand_test = data.demand[:, train_end]
         b_max, mu, sigma = f1.training_parameters(demand_train)
         a, b, uniform_x_u = uniform_inputs(demand_train, price, cost, salvage)
+        mode = triangular_mode(a, b, mu)
         weights = f1.variance_weights(mu, sigma, price, salvage, "portfolio")
         df_x_u = f1.distribution_free_unconstrained_quantities(
             mu, sigma, args.lambda_, weights, price, cost, salvage
@@ -248,6 +315,10 @@ def run_scheme(
                 if model == "uniform":
                     solved = solve_uniform_cuts(
                         a, b, uniform_x_u, price, cost, salvage, capacity, fixed_costs, budget, args
+                    )
+                elif model == "triangular":
+                    solved = solve_triangular_cuts(
+                        a, mode, b, price, cost, salvage, capacity, fixed_costs, budget, args
                     )
                 elif model == "data_driven":
                     solved = f1.solve_data_driven(
@@ -288,6 +359,8 @@ def run_scheme(
                 "Level": level,
                 "Uniform": statistics["uniform"][0],
                 "Uniform_Std": statistics["uniform"][1],
+                "Triangular": statistics["triangular"][0],
+                "Triangular_Std": statistics["triangular"][1],
                 "Data_driven": statistics["data_driven"][0],
                 "DD_Std": statistics["data_driven"][1],
                 "Distribution_free": statistics["distribution_free"][0],
@@ -307,6 +380,7 @@ def read_summary(path: Path) -> list[dict[str, float]]:
             {
                 "Level": float(row["Level"]),
                 "uniform": float(row["Uniform"]),
+                "triangular": float(row["Triangular"]),
                 "data_driven": float(row["Data_driven"]),
                 "distribution_free": float(row["Distribution_free"]),
             }
@@ -357,16 +431,15 @@ def parse_levels(text: str, figure: str) -> tuple[int, ...]:
     return values
 
 
-def build_parser(description: str | None = None) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=description or __doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--figure", choices=tuple(FIGURE_SPECS), required=True)
     parser.add_argument("--input", type=Path, default=f1.default_retail_workbook())
     parser.add_argument("--output-dir", type=Path, help="default: figure<N>_<cost-model>_results next to this script")
     parser.add_argument("--schemes", default="all", help="all or a comma list from: increasing,20,10")
     parser.add_argument("--levels", default="all", help="all or a comma list of K (Figure 2) or kappa (Figure 3)")
     parser.add_argument("--lambda", dest="lambda_", type=float, default=DEFAULT_LAMBDA)
-    parser.add_argument("--cost-model", choices=f1.COST_MODELS, default="random")
+    parser.add_argument("--cost-model", choices=f1.COST_MODELS, default="fixed")
     parser.add_argument("--cost-seed", type=int, default=f1.DEFAULT_COST_SEED)
     parser.add_argument("--mip-gap", type=float, default=f1.MIP_GAP)
     parser.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT_SECONDS)
@@ -379,12 +452,9 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
     return parser
 
 
-def main(
-    argv: Sequence[str] | None = None, figure: str = "2", description: str | None = None
-) -> int:
-    """Run Figure ``figure`` ("2" or "3") with command-line options ``argv``."""
-    require(figure in FIGURE_SPECS, f"unsupported figure {figure!r}")
-    args = build_parser(description).parse_args(argv)
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    figure = args.figure
     require(args.lambda_ >= 0.0, "lambda must be nonnegative")
     require(args.mip_gap >= 0.0, "mip gap must be nonnegative")
     require(args.time_limit > 0.0, "time limit must be positive")
@@ -430,6 +500,7 @@ def main(
         "capacity_fraction": f1.CAPACITY_FRACTION,
         "fixed_cost_epsilon": FIXED_COST_EPSILON,
         "uniform_widening": UNIFORM_WIDENING,
+        "triangular_mode_margin": TRIANGULAR_MODE_MARGIN,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
