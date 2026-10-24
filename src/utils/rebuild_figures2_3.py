@@ -32,9 +32,9 @@ the uniform and triangular models are defined.
 
 Typical commands::
 
-    python rebuild_figures2_3.py --figure 2
-    python rebuild_figures2_3.py --figure 3
-    python rebuild_figures2_3.py --figure 2 --schemes 20 --levels 40 --max-windows 1
+    python utils/rebuild_figures2_3.py --figure 2
+    python utils/rebuild_figures2_3.py --figure 3
+    python utils/rebuild_figures2_3.py --figure 2 --schemes 20 --levels 40 --max-windows 1
 
 Results are checkpointed per (level, training window, model) and resumed on
 re-run.
@@ -388,36 +388,62 @@ def read_summary(path: Path) -> list[dict[str, float]]:
         ]
 
 
-def plot_figure(
-    figure: str, summaries: Mapping[str, Sequence[Mapping[str, float]]], output_root: Path
+def draw_panel(
+    axis: Any,
+    figure: str,
+    scheme: str,
+    summary: Sequence[Mapping[str, float]],
+    *,
+    title: bool = True,
 ) -> None:
+    """Draw one Figure 2/3 panel (one training scheme) on ``axis``."""
+    rows = sorted(summary, key=lambda row: row["Level"])
+    levels = [row["Level"] for row in rows]
+    for model in MODELS:
+        axis.plot(
+            levels,
+            [row[model] for row in rows],
+            color=MODEL_COLORS[model],
+            marker="o",
+            markersize=2.7,
+            linewidth=1.25,
+            label=MODEL_LABELS[model],
+        )
+    axis.set_xlabel(FIGURE_SPECS[figure]["xlabel"], labelpad=0)
+    if title:
+        axis.set_title(SCHEME_TITLES[scheme], y=-0.34, fontsize=10)
+    axis.grid(True, which="major", alpha=0.18, linewidth=0.5)
+    axis.tick_params(axis="both", labelsize=7)
+    axis.legend(loc="upper right", fontsize=6.5, frameon=True)
+
+
+def plot_figure(
+    figure: str,
+    summaries: Mapping[str, Sequence[Mapping[str, float]]],
+    output_root: Path,
+    panel_dir: Path | None = None,
+) -> None:
+    """Write figure<N>_rebuilt.pdf/png to ``output_root`` and, if ``panel_dir``
+    is given, one PDF per panel there (figure<N>_increasing.pdf,
+    figure<N>_T20.pdf, figure<N>_T10.pdf) without the "(a) ..." caption."""
     _, plt = f1.require_plot_dependencies()
     schemes = [name for name in f1.SCHEME_SPECS if name in summaries]
     require(schemes, "there are no summaries to plot")
     fig, axes = plt.subplots(1, len(schemes), figsize=(11.5, 3.25), squeeze=False)
     for axis, scheme in zip(axes[0], schemes):
-        rows = sorted(summaries[scheme], key=lambda row: row["Level"])
-        levels = [row["Level"] for row in rows]
-        for model in MODELS:
-            axis.plot(
-                levels,
-                [row[model] for row in rows],
-                color=MODEL_COLORS[model],
-                marker="o",
-                markersize=2.7,
-                linewidth=1.25,
-                label=MODEL_LABELS[model],
-            )
-        axis.set_xlabel(FIGURE_SPECS[figure]["xlabel"], labelpad=0)
-        axis.set_title(SCHEME_TITLES[scheme], y=-0.34, fontsize=10)
-        axis.grid(True, which="major", alpha=0.18, linewidth=0.5)
-        axis.tick_params(axis="both", labelsize=7)
-        axis.legend(loc="upper right", fontsize=6.5, frameon=True)
+        draw_panel(axis, figure, scheme, summaries[scheme])
     fig.subplots_adjust(left=0.065, right=0.995, top=0.98, bottom=0.31, wspace=0.24)
     output_root.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_root / f"figure{figure}_rebuilt.pdf", bbox_inches="tight")
     fig.savefig(output_root / f"figure{figure}_rebuilt.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
+    if panel_dir is not None:
+        panel_dir.mkdir(parents=True, exist_ok=True)
+        for scheme in schemes:
+            panel, axis = plt.subplots(figsize=f1.PANEL_FIGSIZE)
+            draw_panel(axis, figure, scheme, summaries[scheme], title=False)
+            panel.savefig(panel_dir / f"figure{figure}_{f1.PANEL_TAGS[scheme]}.pdf", bbox_inches="tight")
+            plt.close(panel)
 
 
 def parse_levels(text: str, figure: str) -> tuple[int, ...]:
@@ -447,6 +473,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-windows", type=int, help="limit windows per panel for verification runs")
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument(
+        "--panel-dir",
+        type=Path,
+        help="also save each panel as its own PDF here: figure<N>_increasing.pdf, figure<N>_T20.pdf, figure<N>_T10.pdf",
+    )
     parser.add_argument("--verbose-solver", action="store_true")
     parser.set_defaults(resume=True)
     return parser
@@ -465,7 +496,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     schemes = f1.parse_schemes(args.schemes)
     levels = parse_levels(args.levels, figure)
     if args.output_dir is None:
-        args.output_dir = Path(__file__).resolve().parent / f"figure{figure}_{args.cost_model}_results"
+        args.output_dir = f1.SRC_DIR / f"figure{figure}_{args.cost_model}_results"
     output_root = args.output_dir.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -508,7 +539,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         scheme: run_scheme(figure, scheme, data, levels, output_root, args) for scheme in schemes
     }
     if not args.no_plot:
-        plot_figure(figure, {scheme: read_summary(path) for scheme, path in summary_paths.items()}, output_root)
+        plot_figure(
+            figure,
+            {scheme: read_summary(path) for scheme, path in summary_paths.items()},
+            output_root,
+            panel_dir=args.panel_dir.resolve() if args.panel_dir is not None else None,
+        )
     print(f"Results saved under {output_root}")
     return 0
 

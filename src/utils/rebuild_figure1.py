@@ -55,19 +55,19 @@ Typical commands
 Full run with the portfolio variance bound, from Processed_Online_Retail.xlsx
 located next to this file or in the sibling data folder::
 
-    python rebuild_figure1.py
+    python utils/rebuild_figure1.py
 
 Original (submitted) Figure 1 weights::
 
-    python rebuild_figure1.py --variance-bound sigma2
+    python utils/rebuild_figure1.py --variance-bound sigma2
 
 Short verification run (one panel, one lambda, one rolling window)::
 
-    python rebuild_figure1.py --schemes increasing --lambdas 1e-6 --max-windows 1
+    python utils/rebuild_figure1.py --schemes increasing --lambdas 1e-6 --max-windows 1
 
 Recreate the plot directly from the original Julia summary workbooks::
 
-    python rebuild_figure1.py --plot-only-from "C:\\path\\to\\Loss Functions - comparison"
+    python utils/rebuild_figure1.py --plot-only-from "C:\\path\\to\\Loss Functions - comparison"
 
 Required packages are NumPy, gurobipy, openpyxl, matplotlib, and a licensed
 GUROBI installation.
@@ -88,6 +88,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
+
+SRC_DIR = Path(__file__).resolve().parent.parent
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 
 SIGMA2_LAMBDA_VALUES = (
@@ -163,11 +167,10 @@ SCHEME_SPECS: Mapping[str, tuple[int, int, str]] = {
 
 def default_retail_workbook() -> Path:
     """Find the processed retail workbook in the code or manuscript folder."""
-    script_dir = Path(__file__).resolve().parent
     candidates = (
-        script_dir / "Processed_Online_Retail.xlsx",
-        script_dir.parent / "data" / "Processed_Online_Retail.xlsx",
-        script_dir.parent / "Newsvendor Noam New 23_Sep" / "Processed_Online_Retail.xlsx",
+        SRC_DIR / "Processed_Online_Retail.xlsx",
+        SRC_DIR.parent / "data" / "Processed_Online_Retail.xlsx",
+        SRC_DIR.parent / "Newsvendor Noam New 23_Sep" / "Processed_Online_Retail.xlsx",
     )
     return next((path for path in candidates if path.is_file()), candidates[0])
 
@@ -977,71 +980,94 @@ def read_lambda_max(path: Path) -> float | None:
     return float(rows[0]["Median_Lambda_Max"]) if rows else None
 
 
+PANEL_TAGS: Mapping[str, str] = {"increasing": "increasing", "20": "T20", "10": "T10"}
+PANEL_FIGSIZE = (4.0, 3.0)
+
+
+def draw_panel(
+    axis: Any,
+    scheme: str,
+    summary: Sequence[Mapping[str, float]],
+    lambda_max: float | None,
+    *,
+    title: bool = True,
+) -> None:
+    """Draw one Figure 1 panel (one training scheme) on ``axis``."""
+    rows = sorted((row for row in summary if row["Lambda"] > 0.0), key=lambda row: row["Lambda"])
+    zero_rows = [row for row in summary if row["Lambda"] == 0.0]
+    lambdas = [row["Lambda"] for row in rows]
+    axis.plot(
+        lambdas,
+        [row["Data_driven"] for row in rows],
+        color="#1f77b4",
+        marker="o",
+        markersize=2.7,
+        linewidth=1.25,
+        label="Data-driven",
+    )
+    axis.plot(
+        lambdas,
+        [row["Distribution_free"] for row in rows],
+        color="#e76f51",
+        marker="o",
+        markersize=2.7,
+        linewidth=1.25,
+        label="Distribution-free",
+    )
+    if zero_rows:
+        axis.axhline(
+            zero_rows[0]["Distribution_free"],
+            color="#e76f51",
+            linestyle="--",
+            linewidth=0.9,
+            label=r"Distribution-free, $\lambda=0$",
+        )
+    if lambda_max is not None and lambdas and lambda_max <= 10.0 * lambdas[-1]:
+        axis.axvline(
+            lambda_max,
+            color="0.35",
+            linestyle=":",
+            linewidth=1.0,
+            label=r"median $\lambda_{\max}$",
+        )
+    axis.set_xscale("log")
+    axis.set_xlim(lambdas[0], lambdas[-1])
+    axis.set_xlabel(r"$\lambda$", labelpad=0)
+    if title:
+        axis.set_title(SCHEME_SPECS[scheme][2], y=-0.34, fontsize=10)
+    axis.grid(True, which="major", alpha=0.18, linewidth=0.5)
+    axis.tick_params(axis="both", labelsize=7)
+    axis.legend(loc="upper left", fontsize=6.5, frameon=True)
+
+
 def plot_figure(
     summaries: Mapping[str, Sequence[Mapping[str, float]]],
     output_root: Path,
     lambda_max: Mapping[str, float | None] | None = None,
+    panel_dir: Path | None = None,
 ) -> None:
+    """Write figure1_rebuilt.pdf/png to ``output_root`` and, if ``panel_dir``
+    is given, one PDF per panel there (figure1_increasing.pdf, figure1_T20.pdf,
+    figure1_T10.pdf) without the "(a) ..." caption, for LaTeX subfigures."""
     _, plt = require_plot_dependencies()
     schemes = [name for name in SCHEME_SPECS if name in summaries]
     require(schemes, "there are no summaries to plot")
+    lambda_max = lambda_max or {}
     figure, axes = plt.subplots(1, len(schemes), figsize=(11.5, 3.25), squeeze=False)
     for axis, scheme in zip(axes[0], schemes):
-        rows = sorted(
-            (row for row in summaries[scheme] if row["Lambda"] > 0.0),
-            key=lambda row: row["Lambda"],
-        )
-        zero_rows = [row for row in summaries[scheme] if row["Lambda"] == 0.0]
-        lambdas = [row["Lambda"] for row in rows]
-        data_driven = [row["Data_driven"] for row in rows]
-        distribution_free = [row["Distribution_free"] for row in rows]
-        axis.plot(
-            lambdas,
-            data_driven,
-            color="#1f77b4",
-            marker="o",
-            markersize=2.7,
-            linewidth=1.25,
-            label="Data-driven",
-        )
-        axis.plot(
-            lambdas,
-            distribution_free,
-            color="#e76f51",
-            marker="o",
-            markersize=2.7,
-            linewidth=1.25,
-            label="Distribution-free",
-        )
-        if zero_rows:
-            axis.axhline(
-                zero_rows[0]["Distribution_free"],
-                color="#e76f51",
-                linestyle="--",
-                linewidth=0.9,
-                label=r"Distribution-free, $\lambda=0$",
-            )
-        scheme_lambda_max = (lambda_max or {}).get(scheme)
-        if scheme_lambda_max is not None and lambdas and scheme_lambda_max <= 10.0 * lambdas[-1]:
-            axis.axvline(
-                scheme_lambda_max,
-                color="0.35",
-                linestyle=":",
-                linewidth=1.0,
-                label=r"median $\lambda_{\max}$",
-            )
-        axis.set_xscale("log")
-        axis.set_xlim(lambdas[0], lambdas[-1])
-        axis.set_xlabel(r"$\lambda$", labelpad=0)
-        axis.set_title(SCHEME_SPECS[scheme][2], y=-0.34, fontsize=10)
-        axis.grid(True, which="major", alpha=0.18, linewidth=0.5)
-        axis.tick_params(axis="both", labelsize=7)
-        axis.legend(loc="upper left", fontsize=6.5, frameon=True)
+        draw_panel(axis, scheme, summaries[scheme], lambda_max.get(scheme))
     figure.subplots_adjust(left=0.065, right=0.995, top=0.98, bottom=0.31, wspace=0.24)
     output_root.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_root / "figure1_rebuilt.pdf", bbox_inches="tight")
     figure.savefig(output_root / "figure1_rebuilt.png", dpi=300, bbox_inches="tight")
     plt.close(figure)
+    if panel_dir is not None:
+        panel_dir.mkdir(parents=True, exist_ok=True)
+        for scheme in schemes:
+            panel, axis = plt.subplots(figsize=PANEL_FIGSIZE)
+            draw_panel(axis, scheme, summaries[scheme], lambda_max.get(scheme), title=False)
+            panel.savefig(panel_dir / f"figure1_{PANEL_TAGS[scheme]}.pdf", bbox_inches="tight")
+            plt.close(panel)
 
 
 def parse_schemes(text: str) -> tuple[str, ...]:
@@ -1064,7 +1090,6 @@ def parse_lambdas(text: str, variance_bound: str) -> tuple[float, ...]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    script_directory = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=default_retail_workbook())
     parser.add_argument(
@@ -1107,6 +1132,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-windows", type=int, help="limit windows per panel for verification runs")
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument(
+        "--panel-dir",
+        type=Path,
+        help="also save each panel as its own PDF here: figure1_increasing.pdf, figure1_T20.pdf, figure1_T10.pdf",
+    )
     parser.add_argument("--verbose-solver", action="store_true")
     parser.set_defaults(resume=True, zero_lambda=True)
     return parser
@@ -1121,7 +1151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_windows is not None:
         require(args.max_windows >= 1, "max-windows must be positive")
     if args.output_dir is None:
-        args.output_dir = Path(__file__).resolve().parent / default_output_directory(
+        args.output_dir = SRC_DIR / default_output_directory(
             args.variance_bound, args.cost_model
         )
 
@@ -1191,7 +1221,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             scheme: read_lambda_max(path.parent / "lambda_max_summary.csv")
             for scheme, path in summary_paths.items()
         }
-        plot_figure(summaries, output_root, lambda_max)
+        plot_figure(
+            summaries,
+            output_root,
+            lambda_max,
+            panel_dir=args.panel_dir.resolve() if args.panel_dir is not None else None,
+        )
     print(f"Results saved under {output_root}")
     return 0
 
