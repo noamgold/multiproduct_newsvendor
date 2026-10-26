@@ -1,0 +1,34 @@
+\begin{table}[htbp]
+\centering
+\caption{Computational running-time comparison for triangular-distributed
+demands. The Gurobi Big-M and perspective formulations are compared with the
+2018 cubic MINLP formulation solved by SCIP. The relative optimality-gap
+target is $0.001$ ($0.1\%$), with a one-hour time limit per solve.}
+\label{tab:triangular-2018-comparison}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lllrrrrrr}
+\toprule
+Formulation & Metric & Statistic
+  & $n=100$ & $n=200$ & $n=300$ & $n=400$ & $n=500$ & $n=600$ \\
+\midrule
+  \multirow{5}{*}{Big-M (9), Gurobi} & CPU Sec & Avg & $7.206\mathrm{E}{-01}$ & $1.525\mathrm{E}{+00}$ & $2.237\mathrm{E}{+00}$ & $1.703\mathrm{E}{+00}$ & $3.136\mathrm{E}{+00}$ & $3.775\mathrm{E}{+00}$ \\
+   & CPU Sec & Avg inc lim & $7.206\mathrm{E}{-01}$ & $1.525\mathrm{E}{+00}$ & $2.237\mathrm{E}{+00}$ & $1.703\mathrm{E}{+00}$ & $3.136\mathrm{E}{+00}$ & $3.775\mathrm{E}{+00}$ \\
+   & B\&B Nodes & Avg & $7.417\mathrm{E}{+01}$ & $8.787\mathrm{E}{+01}$ & $1.126\mathrm{E}{+02}$ & $4.323\mathrm{E}{+01}$ & $1.050\mathrm{E}{+02}$ & $8.397\mathrm{E}{+01}$ \\
+   & B\&B Nodes & Avg inc lim & $7.417\mathrm{E}{+01}$ & $8.787\mathrm{E}{+01}$ & $1.126\mathrm{E}{+02}$ & $4.323\mathrm{E}{+01}$ & $1.050\mathrm{E}{+02}$ & $8.397\mathrm{E}{+01}$ \\
+   & Time Limit & Number & $0$ & $0$ & $0$ & $0$ & $0$ & $0$ \\
+\midrule
+  \multirow{5}{*}{Perspective, Gurobi} & CPU Sec & Avg & $6.856\mathrm{E}{-01}$ & $1.863\mathrm{E}{+00}$ & $2.040\mathrm{E}{+00}$ & $1.584\mathrm{E}{+00}$ & $2.425\mathrm{E}{+00}$ & $2.494\mathrm{E}{+00}$ \\
+   & CPU Sec & Avg inc lim & $6.856\mathrm{E}{-01}$ & $1.863\mathrm{E}{+00}$ & $2.040\mathrm{E}{+00}$ & $1.584\mathrm{E}{+00}$ & $2.425\mathrm{E}{+00}$ & $2.494\mathrm{E}{+00}$ \\
+   & B\&B Nodes & Avg & $8.430\mathrm{E}{+01}$ & $1.354\mathrm{E}{+02}$ & $1.080\mathrm{E}{+02}$ & $5.347\mathrm{E}{+01}$ & $9.957\mathrm{E}{+01}$ & $5.620\mathrm{E}{+01}$ \\
+   & B\&B Nodes & Avg inc lim & $8.430\mathrm{E}{+01}$ & $1.354\mathrm{E}{+02}$ & $1.080\mathrm{E}{+02}$ & $5.347\mathrm{E}{+01}$ & $9.957\mathrm{E}{+01}$ & $5.620\mathrm{E}{+01}$ \\
+   & Time Limit & Number & $0$ & $0$ & $0$ & $0$ & $0$ & $0$ \\
+\midrule
+  \multirow{5}{*}{2018 cubic MINLP, SCIP} & CPU Sec & Avg & $2.567\mathrm{E}{+02}$ & $2.105\mathrm{E}{+02}$ & $8.600\mathrm{E}{+01}$ & $7.200\mathrm{E}{+01}$ & $1.407\mathrm{E}{+02}$ & $6.830\mathrm{E}{+02}$ \\
+   & CPU Sec & Avg inc lim & $9.253\mathrm{E}{+02}$ & $2.357\mathrm{E}{+03}$ & $2.897\mathrm{E}{+03}$ & $2.777\mathrm{E}{+03}$ & $2.562\mathrm{E}{+03}$ & $3.211\mathrm{E}{+03}$ \\
+   & B\&B Nodes & Avg & $1.040\mathrm{E}{+04}$ & $4.881\mathrm{E}{+03}$ & $4.875\mathrm{E}{+02}$ & $4.329\mathrm{E}{+01}$ & $2.366\mathrm{E}{+02}$ & $7.774\mathrm{E}{+03}$ \\
+   & B\&B Nodes & Avg inc lim & $5.748\mathrm{E}{+04}$ & $5.773\mathrm{E}{+04}$ & $4.071\mathrm{E}{+04}$ & $3.282\mathrm{E}{+04}$ & $2.919\mathrm{E}{+04}$ & $3.063\mathrm{E}{+04}$ \\
+   & Time Limit & Number & $6$ & $19$ & $24$ & $23$ & $21$ & $26$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}

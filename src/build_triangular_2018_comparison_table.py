@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a Table-2-style snapshot of Gurobi versus the 2018 SCIP MINLP."""
+"""Build manuscript Table 4 from all 30 triangular comparison replications."""
 
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from pathlib import Path
 
 
 BASE = Path(__file__).resolve().parent
-INPUT = BASE / "triangular_table2_scip_minlp_comparison.csv"
-OUTPUT_MD = BASE / "triangular_2018_comparison_table_current.md"
-OUTPUT_CSV = BASE / "triangular_2018_comparison_summary_current.csv"
-OUTPUT_TEX = BASE / "triangular_2018_comparison_table_current.tex"
+REPO_DATA = BASE.parent / "data" / "triangular_table2_scip_minlp_comparison.csv"
+INPUT = REPO_DATA if REPO_DATA.exists() else BASE / "triangular_table2_scip_minlp_comparison.csv"
+OUTPUT_DIR = BASE.parent / "tables" if REPO_DATA.exists() else BASE
+OUTPUT_MD = OUTPUT_DIR / "table4_triangular_2018.md"
+OUTPUT_CSV = OUTPUT_DIR / "table4_triangular_2018_summary.csv"
+OUTPUT_TEX = OUTPUT_DIR / "table4_triangular_2018.tex"
 N_VALUES = (100, 200, 300, 400, 500, 600)
 BIGM = "CURRENT_TRIANGULAR_BIGM_FIXED_COST"
 PERSPECTIVE = "CURRENT_TRIANGULAR_PERSPECTIVE_FIXED_COST"
@@ -65,6 +67,10 @@ def main() -> int:
         }
         for n in N_VALUES:
             rows = [row for row in source if int(row["n"]) == n and row["model_id"] == model_id]
+            if len(rows) != 30 or len({row["replication"] for row in rows}) != 30:
+                raise ValueError(f"{label}, n={n}: expected 30 distinct replications, found {len(rows)}")
+            if any(row["status"] not in {"optimal", "user_limit", "time_limit"} for row in rows):
+                raise ValueError(f"{label}, n={n}: unexpected Gurobi status")
             optimal = [row for row in rows if row["status"] == "optimal"]
             values["time_avg"].append(fmt(mean_field(optimal, "solve_seconds")))
             values["time_all"].append(fmt(mean_field(rows, "solve_seconds")))
@@ -96,8 +102,12 @@ def main() -> int:
             row for row in source
             if int(row["n"]) == n and row["model_id"] == BIGM and present(row.get("minlp_status"))
         ]
+        if len(rows) != 30 or len({row["replication"] for row in rows}) != 30:
+            raise ValueError(f"SCIP, n={n}: expected 30 distinct replications, found {len(rows)}")
         successful = [row for row in rows if is_scip_success(row["minlp_status"])]
         limited = [row for row in rows if "time limit reached" in row["minlp_status"].lower()]
+        if len(successful) + len(limited) != len(rows):
+            raise ValueError(f"SCIP, n={n}: unexpected solver status")
         values["time_avg"].append(fmt(mean_field(successful, "minlp_cpu_seconds")))
         values["time_all"].append(fmt(mean_field(rows, "minlp_cpu_seconds")))
         values["nodes_avg"].append(fmt(mean_field(successful, "minlp_node_count")))
@@ -138,18 +148,9 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(summary)
 
-    minlp_n600 = next(
-        row for row in summary
-        if row["formulation"] == "2018 cubic MINLP, SCIP" and row["n"] == 600
-    )
-    n600_runs = int(minlp_n600["recorded_runs"])
     n_headers = [f"$n={n}$" for n in N_VALUES]
-    if n600_runs < 30:
-        n_headers[-1] = "$n=600^{\\dagger}$"
     tex_lines = [
-        "\\documentclass[10pt]{article}", "", "\\usepackage[margin=1in]{geometry}",
-        "\\usepackage{booktabs}", "\\usepackage{graphicx}", "\\usepackage{multirow}",
-        "", "\\begin{document}", "", "\\begin{table}[htbp]", "\\centering",
+        "\\begin{table}[htbp]", "\\centering",
         "\\caption{Computational running-time comparison for triangular-distributed",
         "demands. The Gurobi Big-M and perspective formulations are compared with the",
         "2018 cubic MINLP formulation solved by SCIP. The relative optimality-gap",
@@ -176,16 +177,7 @@ def main() -> int:
         )
         previous = formulation
     tex_lines.extend(["\\bottomrule", "\\end{tabular}%", "}"])
-    if n600_runs < 30:
-        tex_lines.extend([
-            "", "\\vspace{0.5em}", "\\begin{minipage}{\\textwidth}", "\\footnotesize",
-            f"$^{{\\dagger}}$The SCIP $n=600$ column is a partial snapshot based on {n600_runs} completed",
-            "runs. The experiment is still running. The columns $n=100,\\ldots,500$",
-            "contain all 30 runs. ``Avg'' uses solves that reached the configured gap;",
-            "``Avg inc lim'' also includes time-limited solves.",
-            "\\end{minipage}",
-        ])
-    tex_lines.extend(["\\end{table}", "", "\\end{document}", ""])
+    tex_lines.extend(["\\end{table}", ""])
     OUTPUT_TEX.write_text("\n".join(tex_lines), encoding="utf-8")
 
     print(OUTPUT_MD)
