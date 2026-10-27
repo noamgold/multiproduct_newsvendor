@@ -1,0 +1,17 @@
+{
+  "source_csv": "data/distribution_free_table3_instances_strongly_correlated.csv",
+  "source_sha256": "00fcb6146d1384f04f895d6189bfbce287657022cee2b0069d6c6546b25e829f",
+  "instance_derivation": "portfolio_cv_recompute_xu_score_k_K_C_v1",
+  "n_values": "all",
+  "replications": "all",
+  "lambda": 0.0001,
+  "epsilon": 1e-09,
+  "time_limit_seconds": 3600.0,
+  "mip_gap": 0.0005,
+  "threads": 1,
+  "solver": "GUROBI",
+  "methods": ["bigm", "perspective", "cuts"],
+  "cut_family": "dual",
+  "results_csv": "data/table3_cv_regenerated_results.csv",
+  "manifest_csv": "data/table3_cv_regenerated_instances.csv"
+}

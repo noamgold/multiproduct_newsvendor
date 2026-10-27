@@ -22,10 +22,11 @@ in closed form, and the manuscript writes the resulting problem as a
                  + (p_i - s_i) [ sqrt(sigma_i^2 + (x - mu_i)^2) - x + mu_i ] / 2
     g_i(x)     = theta_i(x) + lambda (p_i - s_i)^2 sigma_i^2 x^2
 
-with the lambda term a variance penalty (lambda = 1e-9 in the Table 3
+with the lambda term a variance penalty (lambda = 1e-9 in the stored Table 3
 instances). g_i is strictly convex, and x^U_i is its unconstrained
 minimizer. with_portfolio_variance_bound switches an instance to the
-portfolio variance bound, weights (p_i - s_i)^2 sigma_i^2 / mu_i^2. Formulation (11), big-M:
+portfolio variance bound, weights (p_i - s_i)^2 sigma_i^2 / mu_i^2, and
+recomputes the profit scores and budgets for that objective. Formulation (11), big-M:
 
     min  sum_i theta_i + lambda sum_i (p_i - s_i)^2 sigma_i^2 x_i^2   (11a)
     s.t. (c_i-s_i)x_i + (p_i-s_i)(nu_i - x_i + mu_i)/2 <= theta_i     (11b')
@@ -107,6 +108,8 @@ DEFAULT_INSTANCES_CSV = gmti.CSV_FILENAMES["DISTRIBUTION_FREE"]
 
 TABLE3_N_VALUES = (100, 200, 300, 400, 500, 600, 700)
 TABLE3_REPLICATIONS = tuple(range(1, 31))
+PORTFOLIO_CV_REGENERATED_VERSION = "PORTFOLIO_CV_REGENERATED_V1"
+PORTFOLIO_FIXED_COST_EPSILON = 1.0e-9
 
 
 class DistributionFreeError(RuntimeError):
@@ -219,15 +222,14 @@ def zero_quantity_cost(instance: DistributionFreeInstance) -> float:
 
 
 def with_portfolio_variance_bound(
-    instance: DistributionFreeInstance, lambda_: float
+    instance: DistributionFreeInstance, lambda_: float, *, regenerate_budgets: bool = True
 ) -> DistributionFreeInstance:
     """The same instance under the portfolio variance bound: penalty weights
     w_i = (p_i - s_i)^2 sigma_i^2 / mu_i^2 and penalty parameter ``lambda_``.
 
-    Only x^U depends on the penalty, so it is recomputed (it is the big-M
-    constant of (11c)); mu, sigma, prices, k, K and C are kept as stored.
-    k and fixed_cost_score therefore remain the profit scores of the stored
-    model, whose penalty (lambda = 1e-9) is negligible.
+    Recompute x^U, the profit scores, fixed costs, and capacity for the new
+    objective. ``regenerate_budgets=False`` retains the historical behavior
+    of keeping scores and budgets from the stored sigma-squared instance.
     """
     require(lambda_ >= 0.0, "lambda must be nonnegative")
     require(all(mu > 0.0 for mu in instance.mu), f"{instance.instance_id}: mu must be positive")
@@ -259,8 +261,37 @@ def with_portfolio_variance_bound(
             else:
                 high = middle
         x_u.append(0.5 * (low + high))
-    return dataclasses.replace(
+    portfolio_instance = dataclasses.replace(
         instance, lambda_=float(lambda_), variance_weight=weights, x_u=tuple(x_u)
+    )
+    if not regenerate_budgets:
+        return portfolio_instance
+
+    costs_zero = _product_costs(portfolio_instance, [0.0] * instance.n)
+    costs_optimum = _product_costs(portfolio_instance, portfolio_instance.x_u)
+    raw_scores = [
+        at_zero - at_optimum
+        for at_zero, at_optimum in zip(costs_zero, costs_optimum, strict=True)
+    ]
+    require(
+        min(raw_scores) >= -1.0e-7,
+        f"{instance.instance_id}: negative unconstrained profit score",
+    )
+    scores = tuple(max(0.0, value) for value in raw_scores)
+    k = tuple(score + PORTFOLIO_FIXED_COST_EPSILON for score in scores)
+    K = instance.kappa / 101.0 * sum(k)
+    C = instance.capacity_fraction * sum(portfolio_instance.x_u)
+    require(
+        all(value > 0.0 for value in k) and K > 0.0 and C > 0.0,
+        f"{instance.instance_id}: invalid regenerated budgets",
+    )
+    return dataclasses.replace(
+        portfolio_instance,
+        fixed_cost_score=scores,
+        k=k,
+        K=K,
+        C=C,
+        generation_version=PORTFOLIO_CV_REGENERATED_VERSION,
     )
 
 

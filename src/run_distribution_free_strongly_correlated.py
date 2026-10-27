@@ -58,8 +58,9 @@ VARIANCE PENALTY
 ----------------
 By default (--variance-bound portfolio) the penalty uses the portfolio
 variance bound, weights (p_i-s_i)^2 sigma_i^2 / mu_i^2, with lambda = 1e-4
-(--lambda); x^U is recomputed from the stored mu and sigma, and k, K and C
-are used as stored. --variance-bound sigma2 reproduces the stored model
+(--lambda); x^U, the profit scores, k, K, and C are recomputed for that
+objective. --portfolio-budgets stored restores the previous behavior of
+keeping the sigma2 instance's scores and budgets. --variance-bound sigma2 reproduces the stored model
 (weights (p_i-s_i)^2 sigma_i^2, lambda = 1e-9).
 
 Usage:
@@ -85,13 +86,14 @@ import triangular_current as tc
 
 DEFAULT_INSTANCES_CSV = gscd.DEFAULT_OUTPUT_CSV
 DEFAULT_RESULTS_CSV = {
-    "portfolio": "strongly_correlated_table3_portfolio_results_with_cuts.csv",
+    "portfolio": "strongly_correlated_table3_portfolio_cv_regenerated_results.csv",
     "sigma2": "strongly_correlated_table3_results_with_cuts.csv",
 }
+LEGACY_PORTFOLIO_RESULTS_CSV = "strongly_correlated_table3_portfolio_results_with_cuts.csv"
 
 # Variance penalty. "portfolio" (default): weights (p-s)^2 sigma^2 / mu^2
-# with DEFAULT_PORTFOLIO_LAMBDA, x^U recomputed from the stored mu, sigma
-# (dft.with_portfolio_variance_bound); k, K and C are used as stored.
+# with DEFAULT_PORTFOLIO_LAMBDA, x^U, profit scores, k, K, and C are
+# recomputed (dft.with_portfolio_variance_bound).
 # "sigma2": the stored instances' weights (p-s)^2 sigma^2 and lambda = 1e-9.
 # The portfolio weights are the sigma2 weights divided by mu^2, with mu
 # in [100, 500], so lambda = 1e-4 keeps the penalty at a comparable strength
@@ -392,6 +394,10 @@ def make_parser() -> argparse.ArgumentParser:
         "--lambda", dest="lambda_", type=float, default=DEFAULT_PORTFOLIO_LAMBDA,
         help="penalty parameter for --variance-bound portfolio (sigma2 uses the stored 1e-9)",
     )
+    parser.add_argument(
+        "--portfolio-budgets", choices=("regenerated", "stored"), default="regenerated",
+        help="recompute scores, k, K, and C for the portfolio objective (default), or retain stored sigma2 values",
+    )
     parser.add_argument("--results-csv", help="default depends on --variance-bound")
     parser.add_argument(
         "--cut-family", choices=tsc.CUT_FAMILY_CHOICES, default=tsc.DEFAULT_CUT_FAMILY,
@@ -463,9 +469,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         instances_path, n_values, replications
     )
     if args.variance_bound == "portfolio":
-        instances = [dft.with_portfolio_variance_bound(instance, args.lambda_) for instance in instances]
+        instances = [
+            dft.with_portfolio_variance_bound(
+                instance, args.lambda_, regenerate_budgets=args.portfolio_budgets == "regenerated"
+            )
+            for instance in instances
+        ]
 
-    results_path = base / (args.results_csv or DEFAULT_RESULTS_CSV[args.variance_bound])
+    default_results_csv = DEFAULT_RESULTS_CSV[args.variance_bound]
+    if args.variance_bound == "portfolio" and args.portfolio_budgets == "stored":
+        default_results_csv = LEGACY_PORTFOLIO_RESULTS_CSV
+    results_path = base / (args.results_csv or default_results_csv)
     completed_keys: set[tuple[str, str, str]] = set()
     append_existing = args.resume and results_path.exists() and results_path.stat().st_size > 0
     if append_existing:
@@ -514,6 +528,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         mip_gap=args.mip_gap,
                         threads=args.threads,
                     )
+                if result["status"] not in {"optimal", "user_limit", "time_limit"}:
+                    raise RuntimeError(
+                        f"{instance.instance_id} {method}: solver returned {result['status']!r}"
+                    )
+                if result["status"] != "optimal" and not result["has_incumbent"]:
+                    print(f"{instance.instance_id} {method}: time limit reached without incumbent")
+                if result["soc_ok"] is False:
+                    print(f"{instance.instance_id} {method}: cone-feasibility validation flag")
                 results_by_method[method] = result
                 print(
                     f"{instance.instance_id} {METHOD_LABELS[method]}: "
